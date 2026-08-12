@@ -34,6 +34,8 @@ from mp_persondet import MPPersonDet
 from pose_action_recognizer import PutLuggageRecognizer
 
 
+PUT_LUGGAGE_DISPLAY_TEXT = "旅客正在放置行李"
+
 
 def _find_person_detection_model():
     """Locate the person detection ONNX model in several likely places.
@@ -599,9 +601,27 @@ class PoseVideoThread(QThread):
                    (14, 86), cv.FONT_HERSHEY_SIMPLEX, 0.55,
                    color, 1, cv.LINE_AA)
         if action_result.state == "put_luggage":
-            cv.putText(display, "PUT LUGGAGE",
-                       (14, 110), cv.FONT_HERSHEY_SIMPLEX, 0.75,
-                       (0, 0, 255), 2, cv.LINE_AA)
+            PoseVideoThread._draw_chinese_text(
+                display, PUT_LUGGAGE_DISPLAY_TEXT,
+                x=14, y=94, color=QColor(255, 40, 40), point_size=16)
+
+    @staticmethod
+    def _draw_chinese_text(display, text, x, y, color, point_size=16):
+        image_rgb = cv.cvtColor(display, cv.COLOR_BGR2RGB)
+        h, w, ch = image_rgb.shape
+        qimg = QImage(image_rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
+        painter = QPainter(qimg)
+        painter.setPen(color)
+        font = painter.font()
+        font.setPointSize(point_size)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(x, y + point_size, text)
+        painter.end()
+        ptr = qimg.bits()
+        ptr.setsize(qimg.byteCount())
+        rendered = np.array(ptr).reshape(h, w, ch)
+        display[:, :, :] = cv.cvtColor(rendered, cv.COLOR_RGB2BGR)
 
     def _detect_persons(self, frame):
         """Run person detection on the given (possibly cropped) frame."""
