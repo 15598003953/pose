@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import json
+import uuid
 import numpy as np
 import cv2 as cv
 
@@ -30,6 +31,7 @@ from PyQt5.QtWidgets import (
 
 from mp_pose import MPPose
 from mp_persondet import MPPersonDet
+from pose_action_recognizer import PutLuggageRecognizer
 
 
 
@@ -423,6 +425,9 @@ class PoseVideoThread(QThread):
         self._pause = False
         self.cap = None
         self._seek_frame = None  # frame index to seek to (None = no pending seek)
+        self.action_recognizer = PutLuggageRecognizer()
+        self.event_log_path = self._make_event_log_path(video_path)
+        self._event_log = None
 
     def seek_to(self, frame_idx):
         """Request the thread to jump to a given frame index."""
@@ -441,7 +446,9 @@ class PoseVideoThread(QThread):
                 fps = float(fps) if fps and float(fps) > 0 else 30.0
             except (TypeError, ValueError):
                 fps = 30.0
+            self.action_recognizer = PutLuggageRecognizer(fps=fps)
             frame_interval_ms = int(1000.0 / fps)
+            self._open_event_log()
 
             tm = cv.TickMeter()
             frame_idx = 0
@@ -515,6 +522,13 @@ class PoseVideoThread(QThread):
                     show_mask=self.show_mask,
                     show_bbox=self.show_bbox,
                 )
+                timestamp_ms = int(frame_idx * 1000.0 / fps)
+                action_result = self.action_recognizer.update(
+                    poses, frame_idx=frame_idx, timestamp_ms=timestamp_ms)
+                for event in action_result.events:
+                    self._write_action_event(event)
+                self._draw_action_overlay(display, action_result)
+
                 # Draw every active ROI rectangle with its 1-based number.
                 for roi_num, (rx1, ry1, rx2, ry2) in active_roi_rects:
                     cv.rectangle(display, (rx1, ry1), (rx2 - 1, ry2 - 1),
@@ -547,8 +561,47 @@ class PoseVideoThread(QThread):
         except Exception as e:
             self.error.emit(str(e))
         finally:
+            self._close_event_log()
             if self.cap is not None:
                 self.cap.release()
+
+    @staticmethod
+    def _make_event_log_path(video_path):
+        result_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result")
+        os.makedirs(result_dir, exist_ok=True)
+        video_name = os.path.splitext(os.path.basename(video_path or "video"))[0]
+        safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in video_name)
+        return os.path.join(result_dir, "{}_put_luggage_events.jsonl".format(safe_name or "video"))
+
+    def _open_event_log(self):
+        self._close_event_log()
+        self._event_log = open(self.event_log_path, "a", encoding="utf-8")
+
+    def _close_event_log(self):
+        if self._event_log is not None:
+            self._event_log.close()
+            self._event_log = None
+
+    def _write_action_event(self, event):
+        payload = dict(event)
+        payload["event_id"] = str(uuid.uuid4())
+        payload["video_path"] = self.video_path
+        payload["log_time_ms"] = int(time.time() * 1000)
+        if self._event_log is not None:
+            self._event_log.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._event_log.flush()
+
+    @staticmethod
+    def _draw_action_overlay(display, action_result):
+        color = (0, 0, 255) if action_result.state == "put_luggage" else (0, 255, 255)
+        cv.rectangle(display, (8, 64), (420, 116), (0, 0, 0), -1)
+        cv.putText(display, action_result.debug_text,
+                   (14, 86), cv.FONT_HERSHEY_SIMPLEX, 0.55,
+                   color, 1, cv.LINE_AA)
+        if action_result.state == "put_luggage":
+            cv.putText(display, "PUT LUGGAGE",
+                       (14, 110), cv.FONT_HERSHEY_SIMPLEX, 0.75,
+                       (0, 0, 255), 2, cv.LINE_AA)
 
     def _detect_persons(self, frame):
         """Run person detection on the given (possibly cropped) frame."""

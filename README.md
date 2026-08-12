@@ -44,6 +44,25 @@ cmake --build build
 
 ![webcam demo](./example_outputs/mpposeest_demo.webp)
 
+## PyQt video app
+
+Run the local video analysis app:
+
+```bash
+python pose_app.py
+```
+
+The app loads the local pose ONNX model, detects people, estimates pose
+landmarks, and overlays a first-pass `PUT LUGGAGE` action state when the pose
+sequence matches a hand-down, low-hold, release pattern. Events are appended to:
+
+```text
+result/<video_name>_put_luggage_events.jsonl
+```
+
+This first version recognizes the body posture pattern only. It does not prove
+that a physical bag exists in the frame.
+
 ## License
 
 All files in this directory are licensed under [Apache 2.0 License](LICENSE).
