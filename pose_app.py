@@ -9,6 +9,7 @@ PyQt5 GUI program for MediaPipe pose estimation on video.
 """
 
 import os
+import importlib.util
 import sys
 import time
 import json
@@ -26,6 +27,7 @@ from PyQt5.QtGui import QImage, QPixmap, QPainter, QPen, QColor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QSlider, QStatusBar, QCheckBox,
+    QComboBox,
     QGroupBox, QMessageBox, QDialog
 )
 
@@ -33,8 +35,23 @@ from mp_pose import MPPose
 from mp_persondet import MPPersonDet
 from pose_action_recognizer import PutLuggageRecognizer
 
+POSEC3D_AVAILABLE = importlib.util.find_spec("mmaction") is not None
+try:
+    from posec3d_action_recognizer import PoseC3DRecognizer
+except Exception:
+    PoseC3DRecognizer = None
+    POSEC3D_AVAILABLE = False
+
 
 PUT_LUGGAGE_DISPLAY_TEXT = "旅客正在放置行李"
+POSEC3D_PUT_LUGGAGE_LABELS = {
+    "garbage collecting",
+    "pushing cart",
+    "setting table",
+    "unboxing",
+    "canoeing or kayaking",
+}
+POSEC3D_BUSINESS_LABEL_THRESHOLD = 0.3
 
 
 def _find_person_detection_model():
@@ -109,6 +126,32 @@ POSE_MODEL_PATH = os.path.join(
     "pose_estimation_mediapipe_2023mar.onnx"
 )
 
+POSEC3D_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "data",
+    "posec3d_cache",
+)
+
+
+def default_posec3d_device():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def should_show_put_luggage_business_label(
+        state, confidence,
+        threshold=POSEC3D_BUSINESS_LABEL_THRESHOLD):
+    try:
+        score = float(confidence)
+    except (TypeError, ValueError):
+        score = 0.0
+    return str(state).strip().lower() in POSEC3D_PUT_LUGGAGE_LABELS and score >= threshold
+
 # JSON file that stores the ROI rectangle (x, y, w, h). Loaded on startup.
 ROI_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -116,17 +159,24 @@ ROI_CONFIG_PATH = os.path.join(
 )
 
 # BlazePose 33-keypoint connections (excluding auxiliary points)
-# Only the two arms are drawn: shoulder -> elbow -> wrist -> hand.
 POSE_CONNECTIONS = [
-    # Left arm: shoulder -> elbow -> wrist -> hand
+    # Face outline and ears
+    (0, 1), (1, 2), (2, 3), (3, 7),
+    (0, 4), (4, 5), (5, 6), (6, 8),
+    (9, 10),
+    # Torso
+    (11, 12), (11, 23), (12, 24), (23, 24),
+    # Left arm
     (11, 13), (13, 15), (15, 17), (15, 19), (15, 21), (17, 19),
-    # Right arm: shoulder -> elbow -> wrist -> hand
+    # Right arm
     (12, 14), (14, 16), (16, 18), (16, 20), (16, 22), (18, 20),
+    # Left leg
+    (23, 25), (25, 27), (27, 29), (27, 31), (29, 31),
+    # Right leg
+    (24, 26), (26, 28), (28, 30), (28, 32), (30, 32),
 ]
 
-# Keypoint indices that belong to the arms (11..22). Anything outside this
-# range (face 0..10, hips 23..24, legs 25..32) is skipped when drawing joints.
-UPPER_BODY_INDICES = set(range(11, 23))
+BODY_INDICES = set(range(33))
 
 
 def draw_stickman(image, poses, show_skeleton=True, show_points=True,
@@ -171,9 +221,9 @@ def draw_stickman(image, poses, show_skeleton=True, show_points=True,
                     cv.line(overlay, tuple(xy[a]), tuple(xy[b]),
                             (0, 255, 0), 3, cv.LINE_AA)
 
-        # Joint points (upper body only: 11..24)
+        # Joint points
         if show_points:
-            for i in UPPER_BODY_INDICES:
+            for i in BODY_INDICES:
                 if i < len(xy) and keep[i]:
                     cv.circle(overlay, tuple(xy[i]), 4,
                               (0, 0, 255), -1, cv.LINE_AA)
@@ -409,7 +459,9 @@ class PoseVideoThread(QThread):
 
     def __init__(self, video_path, pose_estimator, person_detector,
                  conf_threshold=0.5, show_skeleton=True, show_points=True,
-                 show_mask=False, show_bbox=False, rois=None, parent=None):
+                 show_mask=False, show_bbox=False, rois=None,
+                 recognizer_kind="rule", recognizer_options=None,
+                 parent=None):
         super().__init__(parent)
         self.video_path = video_path
         self.pose_estimator = pose_estimator
@@ -422,14 +474,17 @@ class PoseVideoThread(QThread):
         # List of ROI rectangles (x, y, w, h) in original frame coords.
         # May be updated by the main window while the thread is running.
         self.rois = list(rois) if rois else []
+        self.recognizer_kind = recognizer_kind or "rule"
+        self.recognizer_options = dict(recognizer_options or {})
 
         self._running = True
         self._pause = False
         self.cap = None
         self._seek_frame = None  # frame index to seek to (None = no pending seek)
-        self.action_recognizer = PutLuggageRecognizer()
+        self.action_recognizer = None
         self.event_log_path = self._make_event_log_path(video_path)
         self._event_log = None
+        self._recognizer_device = self.recognizer_options.get("device", "")
 
     def seek_to(self, frame_idx):
         """Request the thread to jump to a given frame index."""
@@ -448,7 +503,7 @@ class PoseVideoThread(QThread):
                 fps = float(fps) if fps and float(fps) > 0 else 30.0
             except (TypeError, ValueError):
                 fps = 30.0
-            self.action_recognizer = PutLuggageRecognizer(fps=fps)
+            self.action_recognizer = self._build_recognizer(fps)
             frame_interval_ms = int(1000.0 / fps)
             self._open_event_log()
 
@@ -485,12 +540,14 @@ class PoseVideoThread(QThread):
                 frame_h, frame_w = frame.shape[:2]
                 rois_val = list(self.rois) if self.rois else []
                 poses = []
+                total_persons = 0
                 # List of (roi_number, (x1, y1, x2, y2)) for drawing.
                 active_roi_rects = []
 
                 if not rois_val:
                     # No ROI: process the full frame.
                     persons = self._detect_persons(frame)
+                    total_persons += len(persons)
                     for person in persons:
                         pose = self._infer_pose(frame, person)
                         if pose is not None:
@@ -510,12 +567,14 @@ class PoseVideoThread(QThread):
                         roi_rect = (x1, y1, x2, y2)
                         active_roi_rects.append((idx + 1, roi_rect))
                         persons = self._detect_persons(detect_frame)
+                        total_persons += len(persons)
                         for person in persons:
                             pose = self._infer_pose(detect_frame, person)
                             if pose is not None:
                                 pose = self._offset_pose(pose, roi_rect, frame_h, frame_w)
                                 poses.append(pose)
                 tm.stop()
+                infer_ms = (time.time() - iter_start) * 1000.0
 
                 display = draw_stickman(
                     frame, poses,
@@ -525,8 +584,16 @@ class PoseVideoThread(QThread):
                     show_bbox=self.show_bbox,
                 )
                 timestamp_ms = int(frame_idx * 1000.0 / fps)
-                action_result = self.action_recognizer.update(
-                    poses, frame_idx=frame_idx, timestamp_ms=timestamp_ms)
+                if self.recognizer_kind == "posec3d":
+                    action_result = self.action_recognizer.update(
+                        poses,
+                        frame_idx=frame_idx,
+                        img_shape=(frame_h, frame_w),
+                        timestamp_ms=timestamp_ms,
+                    )
+                else:
+                    action_result = self.action_recognizer.update(
+                        poses, frame_idx=frame_idx, timestamp_ms=timestamp_ms)
                 for event in action_result.events:
                     self._write_action_event(event)
                 self._draw_action_overlay(display, action_result)
@@ -545,9 +612,19 @@ class PoseVideoThread(QThread):
                                (10, 25), cv.FONT_HERSHEY_SIMPLEX, 0.6,
                                (0, 255, 255), 1, cv.LINE_AA)
                 cv.putText(display,
-                           "detected:{}  poses:{}".format(len(persons), len(poses)),
+                           "detected:{}  poses:{}".format(total_persons, len(poses)),
                            (10, 50), cv.FONT_HERSHEY_SIMPLEX, 0.6,
                            (0, 255, 255), 1, cv.LINE_AA)
+                roi_text = "ROI:{}".format(len(rois_val)) if rois_val else "ROI:FULL"
+                recognizer_text = self.recognizer_kind
+                if self.recognizer_kind == "posec3d" and self._recognizer_device:
+                    recognizer_text += " {}".format(self._recognizer_device)
+                cv.putText(
+                    display,
+                    "{}  {}  infer:{:.0f}ms".format(
+                        roi_text, recognizer_text, infer_ms),
+                    (10, 75), cv.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 255), 1, cv.LINE_AA)
 
                 self.frame_ready.emit(display, tm.getFPS(), frame_idx, total)
                 # Pace playback to the video's own FPS so it doesn't run too fast.
@@ -566,6 +643,24 @@ class PoseVideoThread(QThread):
             self._close_event_log()
             if self.cap is not None:
                 self.cap.release()
+
+    def _build_recognizer(self, fps):
+        if self.recognizer_kind == "posec3d":
+            if PoseC3DRecognizer is None:
+                raise RuntimeError(
+                    "PoseC3D is not available in this environment."
+                )
+            return PoseC3DRecognizer(
+                clip_len=int(self.recognizer_options.get("clip_len", 48)),
+                predict_interval=int(self.recognizer_options.get("predict_interval", 12)),
+                max_persons=int(self.recognizer_options.get("max_persons", 1)),
+                config=self.recognizer_options.get("config") or None,
+                checkpoint=self.recognizer_options.get("checkpoint") or None,
+                label_map=self.recognizer_options.get("label_map") or None,
+                device=self.recognizer_options.get("device", default_posec3d_device()),
+                cache_dir=self.recognizer_options.get("cache_dir") or POSEC3D_CACHE_DIR,
+            )
+        return PutLuggageRecognizer(fps=fps)
 
     @staticmethod
     def _make_event_log_path(video_path):
@@ -604,6 +699,18 @@ class PoseVideoThread(QThread):
             PoseVideoThread._draw_chinese_text(
                 display, PUT_LUGGAGE_DISPLAY_TEXT,
                 x=14, y=94, color=QColor(255, 40, 40), point_size=16)
+        if should_show_put_luggage_business_label(
+                action_result.state, action_result.confidence):
+            cv.rectangle(
+                display,
+                (max(0, display.shape[1] - 300), 8),
+                (display.shape[1] - 8, 54),
+                (0, 0, 0),
+                -1)
+            PoseVideoThread._draw_chinese_text(
+                display, PUT_LUGGAGE_DISPLAY_TEXT,
+                x=max(14, display.shape[1] - 286), y=18,
+                color=QColor(255, 40, 40), point_size=18)
 
     @staticmethod
     def _draw_chinese_text(display, text, x, y, color, point_size=16):
@@ -707,11 +814,15 @@ class PoseMainWindow(QMainWindow):
 
         self.pose_estimator = None
         self.person_detector = None
+        self.pose_model_path = POSE_MODEL_PATH
         self.thread = None
         self.video_path = None
+        self.video_frame_size = None
         self.current_frame = None
+        self.recognizer_kind = "rule"
         # List of ROI rectangles (x, y, w, h) in original frame coords.
         self.rois = []
+        self.roi_frame_size = None
 
         self._build_ui()
         self._init_models()
@@ -730,6 +841,8 @@ class PoseMainWindow(QMainWindow):
         self.btn_play = QPushButton("Play")
         self.btn_pause = QPushButton("Pause")
         self.btn_stop = QPushButton("Stop")
+        self.btn_select_model = QPushButton("Select Pose ONNX")
+        self.cbo_recognizer = QComboBox()
         self.btn_select_roi = QPushButton("框选ROI")
         self.btn_save_roi = QPushButton("保存ROI")
         self.btn_clear_roi = QPushButton("清除ROI")
@@ -739,6 +852,14 @@ class PoseMainWindow(QMainWindow):
         bar.addWidget(self.btn_play)
         bar.addWidget(self.btn_pause)
         bar.addWidget(self.btn_stop)
+        bar.addWidget(self.btn_select_model)
+        self.cbo_recognizer.addItem("Rule")
+        self.cbo_recognizer.addItem("PoseC3D")
+        self.cbo_recognizer.setCurrentIndex(0)
+        if not POSEC3D_AVAILABLE:
+            self.cbo_recognizer.setItemData(1, "PoseC3D requires mmaction2", Qt.ToolTipRole)
+            self.cbo_recognizer.model().item(1).setEnabled(False)
+        bar.addWidget(self.cbo_recognizer)
         bar.addWidget(self.btn_select_roi)
         bar.addWidget(self.btn_save_roi)
         bar.addWidget(self.btn_clear_roi)
@@ -790,17 +911,31 @@ class PoseMainWindow(QMainWindow):
         self.btn_play.clicked.connect(self._play)
         self.btn_pause.clicked.connect(self._pause)
         self.btn_stop.clicked.connect(self._stop)
+        self.btn_select_model.clicked.connect(self._select_pose_model)
+        self.cbo_recognizer.currentIndexChanged.connect(self._on_recognizer_changed)
         self.btn_select_roi.clicked.connect(self._select_roi)
         self.btn_save_roi.clicked.connect(self._save_rois)
         self.btn_clear_roi.clicked.connect(self._clear_rois)
 
+
+    def _on_recognizer_changed(self, index):
+        kind = "posec3d" if index == 1 else "rule"
+        self.recognizer_kind = kind
+        if kind == "posec3d" and not POSEC3D_AVAILABLE:
+            self.status.showMessage("PoseC3D is unavailable in this environment")
+        elif kind == "posec3d":
+            self.status.showMessage("Recognizer: PoseC3D")
+        else:
+            self.status.showMessage("Recognizer: Rule")
+
     def _init_models(self):
-        if not os.path.isfile(POSE_MODEL_PATH):
+        if not os.path.isfile(self.pose_model_path):
             QMessageBox.critical(
                 self, "Model missing",
                 "Pose model not found:\n{}\n\n"
                 "Please place pose_estimation_mediapipe_2023mar.onnx "
-                "in the project folder.".format(POSE_MODEL_PATH))
+                "in the project folder or choose another ONNX model.".format(
+                    self.pose_model_path))
             self.btn_open.setEnabled(False)
             return
         if not _PERSON_MODEL_PATH or not os.path.isfile(_PERSON_MODEL_PATH):
@@ -814,7 +949,7 @@ class PoseMainWindow(QMainWindow):
                 "  - set PERSON_DET_MODEL env var to its path.")
         try:
             print("[pose_app] person det model:", _PERSON_MODEL_PATH)
-            print("[pose_app] pose model:", POSE_MODEL_PATH)
+            print("[pose_app] pose model:", self.pose_model_path)
             self.person_detector = MPPersonDet(
                 modelPath=_PERSON_MODEL_PATH,
                 nmsThreshold=0.3,
@@ -824,17 +959,71 @@ class PoseMainWindow(QMainWindow):
                 targetId=cv.dnn.DNN_TARGET_CPU,
             )
             self.pose_estimator = MPPose(
-                modelPath=POSE_MODEL_PATH,
+                modelPath=self.pose_model_path,
                 confThreshold=0.3,    # more permissive
                 backendId=cv.dnn.DNN_BACKEND_OPENCV,
                 targetId=cv.dnn.DNN_TARGET_CPU,
             )
-            self.status.showMessage("Models loaded.")
+            self.btn_open.setEnabled(True)
+            self.status.showMessage(
+                "Models loaded. Pose: {}".format(
+                    os.path.basename(self.pose_model_path)))
         except Exception as e:
             import traceback
             traceback.print_exc()
             QMessageBox.critical(self, "Model init failed", str(e))
             self.btn_open.setEnabled(False)
+
+    def _select_pose_model(self):
+        start_dir = os.path.dirname(self.pose_model_path) \
+            if self.pose_model_path else os.path.dirname(os.path.abspath(__file__))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Pose ONNX", start_dir,
+            "ONNX Models (*.onnx)")
+        if not path:
+            return
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "Model missing",
+                                "Selected model does not exist:\n{}".format(path))
+            return
+        if not path.lower().endswith(".onnx"):
+            QMessageBox.warning(
+                self, "Invalid model",
+                "This button only accepts the MediaPipe Pose ONNX file.\n"
+                "PoseC3D is selected from the recognizer dropdown.")
+            return
+        lower_name = os.path.basename(path).lower()
+        if "person" in lower_name or "detect" in lower_name:
+            QMessageBox.warning(
+                self, "Invalid pose model",
+                "Selected file looks like a person detection model.\n"
+                "Please choose pose_estimation_mediapipe_2023mar.onnx.")
+            return
+
+        if self.thread is not None and self.thread.isRunning():
+            self._stop()
+
+        old_estimator = self.pose_estimator
+        old_path = self.pose_model_path
+        try:
+            new_estimator = MPPose(
+                modelPath=path,
+                confThreshold=0.3,
+                backendId=cv.dnn.DNN_BACKEND_OPENCV,
+                targetId=cv.dnn.DNN_TARGET_CPU,
+            )
+        except Exception as e:
+            self.pose_estimator = old_estimator
+            self.pose_model_path = old_path
+            QMessageBox.critical(self, "Model init failed",
+                                 "Cannot load pose model:\n{}\n\n{}".format(path, e))
+            return
+
+        self.pose_estimator = new_estimator
+        self.pose_model_path = path
+        self.btn_open.setEnabled(self.person_detector is not None)
+        self.status.showMessage(
+            "Pose model changed: {}".format(os.path.basename(path)))
 
     # ---- Slots ----------------------------------------------------------
     def _open_video(self):
@@ -853,7 +1042,11 @@ class PoseMainWindow(QMainWindow):
                                  "Cannot open video:\n{}".format(path))
             return
         total = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
+        frame_w = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
         cap.release()
+        self.video_frame_size = (frame_w, frame_h)
+        self._validate_rois_for_video(frame_w, frame_h)
         self.slider.setEnabled(total > 0)
         self.slider.setMaximum(max(total - 1, 0))
         self.slider.setValue(0)
@@ -881,6 +1074,11 @@ class PoseMainWindow(QMainWindow):
             show_mask=self.chk_mask.isChecked(),
             show_bbox=self.chk_bbox.isChecked(),
             rois=self.rois,
+            recognizer_kind=self.recognizer_kind,
+            recognizer_options={
+                "device": default_posec3d_device(),
+                "predict_interval": 12,
+            },
         )
         self.thread.frame_ready.connect(self._on_frame)
         self.thread.finished_video.connect(self._on_finished)
@@ -888,6 +1086,7 @@ class PoseMainWindow(QMainWindow):
         self.btn_play.setEnabled(False)
         self.btn_pause.setEnabled(True)
         self.btn_stop.setEnabled(True)
+        self.cbo_recognizer.setEnabled(False)
         self.status.showMessage("Playing...")
         self.thread.start()
 
@@ -905,6 +1104,7 @@ class PoseMainWindow(QMainWindow):
         self.btn_play.setEnabled(bool(self.video_path))
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
+        self.cbo_recognizer.setEnabled(True)
         self.status.showMessage("Stopped")
 
     def _on_frame(self, frame, fps, idx, total):
@@ -912,7 +1112,7 @@ class PoseMainWindow(QMainWindow):
         pix = cv_img_to_qpix(frame)
         scaled = pix.scaled(
             self.display.size(), Qt.KeepAspectRatio,
-            Qt.SmoothTransformation)
+            Qt.FastTransformation)
         self.display.setPixmap(scaled)
         self.status.showMessage(
             "Frame {}/{}  |  FPS {:.1f}".format(idx + 1, total or idx + 1, fps))
@@ -925,6 +1125,7 @@ class PoseMainWindow(QMainWindow):
         self.btn_play.setEnabled(bool(self.video_path))
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
+        self.cbo_recognizer.setEnabled(True)
         self.status.showMessage("Finished")
 
     def _on_error(self, msg):
@@ -969,6 +1170,9 @@ class PoseMainWindow(QMainWindow):
                     loaded.append(tuple(int(v) for v in legacy))
             if loaded:
                 self.rois = loaded
+                frame_size = data.get("frame_size")
+                if isinstance(frame_size, list) and len(frame_size) == 2:
+                    self.roi_frame_size = tuple(int(v) for v in frame_size)
                 print("[pose_app] loaded {} ROI(s) from {}".format(
                     len(self.rois), ROI_CONFIG_PATH))
                 self.status.showMessage("ROI loaded: {} 个".format(len(self.rois)))
@@ -982,8 +1186,11 @@ class PoseMainWindow(QMainWindow):
             return
         try:
             data = {"rois": [list(r) for r in self.rois]}
+            if self.video_frame_size is not None:
+                data["frame_size"] = list(self.video_frame_size)
             with open(ROI_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            self.roi_frame_size = self.video_frame_size
             self.status.showMessage("ROI 已保存: {} 个".format(len(self.rois)))
             QMessageBox.information(
                 self, "保存ROI",
@@ -995,9 +1202,25 @@ class PoseMainWindow(QMainWindow):
     def _clear_rois(self):
         """Clear all ROI rectangles (does not delete the saved file)."""
         self.rois = []
+        self.roi_frame_size = None
         if self.thread is not None:
             self.thread.rois = []
         self.status.showMessage("ROI 已全部清除")
+
+    def _validate_rois_for_video(self, frame_w, frame_h):
+        """Drop saved ROIs when they clearly belong to another video size."""
+        if not self.rois:
+            return
+        expected = self.roi_frame_size
+        if expected is not None and tuple(expected) == (frame_w, frame_h):
+            return
+        self.rois = []
+        self.roi_frame_size = None
+        print(
+            "[pose_app] cleared saved ROI because video size differs or "
+            "roi_config has no frame_size. current_size=({}, {})".format(
+                frame_w, frame_h)
+        )
 
     def _get_frame_for_roi(self):
         """Read a raw frame from the current video for ROI selection."""
@@ -1035,6 +1258,7 @@ class PoseMainWindow(QMainWindow):
         dlg = RoiDialog(frame, rois=self.rois, parent=self)
         if dlg.exec_() == QDialog.Accepted:
             self.rois = list(dlg.rois)
+            self.roi_frame_size = self.video_frame_size
             if self.thread is not None:
                 self.thread.rois = list(self.rois)
             if not self.rois:

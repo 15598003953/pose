@@ -8,6 +8,7 @@ import cv2 as cv
 from mp_persondet import MPPersonDet
 from mp_pose import MPPose
 from pose_action_recognizer import PutLuggageRecognizer
+from posec3d_action_recognizer import PoseC3DRecognizer
 from pose_app import (
     POSE_MODEL_PATH,
     PUT_LUGGAGE_DISPLAY_TEXT,
@@ -26,6 +27,13 @@ def _draw_overlay(frame, result):
         cv.putText(frame, PUT_LUGGAGE_DISPLAY_TEXT,
                    (14, 112), cv.FONT_HERSHEY_SIMPLEX, 0.7,
                    (0, 0, 255), 2, cv.LINE_AA)
+
+
+def _draw_posec3d_overlay(frame, result):
+    cv.rectangle(frame, (8, 64), (620, 118), (0, 0, 0), -1)
+    cv.putText(frame, result.debug_text,
+               (14, 90), cv.FONT_HERSHEY_SIMPLEX, 0.55,
+               (0, 255, 255), 1, cv.LINE_AA)
 
 
 def run(args):
@@ -71,7 +79,19 @@ def run(args):
         backendId=cv.dnn.DNN_BACKEND_OPENCV,
         targetId=cv.dnn.DNN_TARGET_CPU,
     )
-    recognizer = PutLuggageRecognizer(fps=fps / max(args.stride, 1))
+    if args.recognizer == "posec3d":
+        recognizer = PoseC3DRecognizer(
+            clip_len=args.clip_len,
+            predict_interval=args.predict_interval,
+            max_persons=args.max_persons,
+            config=args.config or None,
+            checkpoint=args.checkpoint or None,
+            label_map=args.label_map or None,
+            device=args.device,
+            cache_dir=args.cache_dir,
+        )
+    else:
+        recognizer = PutLuggageRecognizer(fps=fps / max(args.stride, 1))
 
     frame_idx = 0
     processed = 0
@@ -96,7 +116,15 @@ def run(args):
 
             display = draw_stickman(frame, poses)
             timestamp_ms = int(frame_idx * 1000.0 / fps)
-            result = recognizer.update(poses, processed, timestamp_ms=timestamp_ms)
+            if args.recognizer == "posec3d":
+                result = recognizer.update(
+                    poses,
+                    frame_idx=processed,
+                    img_shape=(height, width),
+                    timestamp_ms=timestamp_ms,
+                )
+            else:
+                result = recognizer.update(poses, processed, timestamp_ms=timestamp_ms)
             debug_log.write(json.dumps({
                 "processed_frame": processed,
                 "source_frame_idx": int(frame_idx),
@@ -109,7 +137,10 @@ def run(args):
                 event["source_frame_idx"] = int(frame_idx)
                 event_log.write(json.dumps(event, ensure_ascii=False) + "\n")
                 events += 1
-            _draw_overlay(display, result)
+            if args.recognizer == "posec3d":
+                _draw_posec3d_overlay(display, result)
+            else:
+                _draw_overlay(display, result)
             writer.write(display)
 
             processed += 1
@@ -135,6 +166,15 @@ def main():
     parser.add_argument("--output_dir", default=os.path.join("result", "offline_put_luggage"))
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--max_frames", type=int, default=0)
+    parser.add_argument("--recognizer", choices=["rule", "posec3d"], default="rule")
+    parser.add_argument("--clip_len", type=int, default=48)
+    parser.add_argument("--predict_interval", type=int, default=4)
+    parser.add_argument("--max_persons", type=int, default=1)
+    parser.add_argument("--config", default="")
+    parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--label_map", default="")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--cache_dir", default="")
     run(parser.parse_args())
 
 

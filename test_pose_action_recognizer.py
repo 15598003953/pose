@@ -3,6 +3,7 @@ import unittest
 import numpy as np
 
 from pose_action_recognizer import PutLuggageRecognizer
+from pose_app import should_show_put_luggage_business_label
 
 
 def _pose(
@@ -44,6 +45,23 @@ def _pose(
 
 
 class PutLuggageRecognizerTest(unittest.TestCase):
+    def test_posec3d_related_k400_labels_show_business_label(self):
+        for label in (
+                "garbage collecting",
+                "pushing cart",
+                "setting table",
+                "unboxing",
+                "canoeing or kayaking"):
+            self.assertTrue(
+                should_show_put_luggage_business_label(label, 0.3),
+                label)
+
+    def test_posec3d_unrelated_or_low_score_labels_do_not_show_business_label(self):
+        self.assertFalse(
+            should_show_put_luggage_business_label("playing guitar", 0.9))
+        self.assertFalse(
+            should_show_put_luggage_business_label("unboxing", 0.29))
+
     def test_detects_put_luggage_from_table_operation_posture(self):
         recognizer = PutLuggageRecognizer(fps=12.5)
         events = []
