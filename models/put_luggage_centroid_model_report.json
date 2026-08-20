@@ -1,0 +1,19 @@
+{
+  "total": 41,
+  "label_counts": {
+    "not_put_luggage": 27,
+    "put_luggage": 14
+  },
+  "accuracy": 0.8049,
+  "precision_put_luggage": 0.6875,
+  "recall_put_luggage": 0.7857,
+  "confusion_matrix": {
+    "true_put_pred_put": 11,
+    "true_put_pred_not": 3,
+    "true_not_pred_put": 5,
+    "true_not_pred_not": 22
+  },
+  "mean_put_probability": 0.4373,
+  "warning": "This is a training-set diagnostic baseline on a very small, overlapping dataset; do not treat it as real deployment accuracy.",
+  "feature_count": 45
+}

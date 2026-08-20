@@ -33,7 +33,7 @@ from PyQt5.QtWidgets import (
 
 from mp_pose import MPPose
 from mp_persondet import MPPersonDet
-from pose_action_recognizer import PutLuggageRecognizer
+from pose_action_recognizer import PutLuggageModelRecognizer, PutLuggageRecognizer
 
 POSEC3D_AVAILABLE = importlib.util.find_spec("mmaction") is not None
 try:
@@ -156,6 +156,12 @@ def should_show_put_luggage_business_label(
 ROI_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "roi_config.json"
+)
+
+PUT_LUGGAGE_MODEL_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "models",
+    "put_luggage_centroid_model.json"
 )
 
 # BlazePose 33-keypoint connections (excluding auxiliary points)
@@ -645,6 +651,18 @@ class PoseVideoThread(QThread):
                 self.cap.release()
 
     def _build_recognizer(self, fps):
+        if self.recognizer_kind == "clip_model":
+            if not os.path.isfile(PUT_LUGGAGE_MODEL_PATH):
+                print("[pose_app] put-luggage clip model missing, fallback to rule:", PUT_LUGGAGE_MODEL_PATH)
+                return PutLuggageRecognizer(fps=fps)
+            return PutLuggageModelRecognizer(
+                model_path=PUT_LUGGAGE_MODEL_PATH,
+                fps=fps,
+                clip_seconds=4.0,
+                sample_stride_frames=10,
+                threshold=0.5,
+                cooldown_seconds=2.0,
+            )
         if self.recognizer_kind == "posec3d":
             if PoseC3DRecognizer is None:
                 raise RuntimeError(
@@ -819,7 +837,7 @@ class PoseMainWindow(QMainWindow):
         self.video_path = None
         self.video_frame_size = None
         self.current_frame = None
-        self.recognizer_kind = "rule"
+        self.recognizer_kind = "clip_model" if os.path.isfile(PUT_LUGGAGE_MODEL_PATH) else "rule"
         # List of ROI rectangles (x, y, w, h) in original frame coords.
         self.rois = []
         self.roi_frame_size = None
@@ -853,12 +871,16 @@ class PoseMainWindow(QMainWindow):
         bar.addWidget(self.btn_pause)
         bar.addWidget(self.btn_stop)
         bar.addWidget(self.btn_select_model)
+        self.cbo_recognizer.addItem("ClipModel")
         self.cbo_recognizer.addItem("Rule")
         self.cbo_recognizer.addItem("PoseC3D")
-        self.cbo_recognizer.setCurrentIndex(0)
+        self.cbo_recognizer.setCurrentIndex(0 if self.recognizer_kind == "clip_model" else 1)
+        if not os.path.isfile(PUT_LUGGAGE_MODEL_PATH):
+            self.cbo_recognizer.setItemData(0, "models/put_luggage_centroid_model.json is missing", Qt.ToolTipRole)
+            self.cbo_recognizer.model().item(0).setEnabled(False)
         if not POSEC3D_AVAILABLE:
-            self.cbo_recognizer.setItemData(1, "PoseC3D requires mmaction2", Qt.ToolTipRole)
-            self.cbo_recognizer.model().item(1).setEnabled(False)
+            self.cbo_recognizer.setItemData(2, "PoseC3D requires mmaction2", Qt.ToolTipRole)
+            self.cbo_recognizer.model().item(2).setEnabled(False)
         bar.addWidget(self.cbo_recognizer)
         bar.addWidget(self.btn_select_roi)
         bar.addWidget(self.btn_save_roi)
@@ -919,9 +941,16 @@ class PoseMainWindow(QMainWindow):
 
 
     def _on_recognizer_changed(self, index):
-        kind = "posec3d" if index == 1 else "rule"
+        if index == 0:
+            kind = "clip_model"
+        elif index == 2:
+            kind = "posec3d"
+        else:
+            kind = "rule"
         self.recognizer_kind = kind
-        if kind == "posec3d" and not POSEC3D_AVAILABLE:
+        if kind == "clip_model":
+            self.status.showMessage("Recognizer: ClipModel")
+        elif kind == "posec3d" and not POSEC3D_AVAILABLE:
             self.status.showMessage("PoseC3D is unavailable in this environment")
         elif kind == "posec3d":
             self.status.showMessage("Recognizer: PoseC3D")

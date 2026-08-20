@@ -52,16 +52,114 @@ Run the local video analysis app:
 python pose_app.py
 ```
 
-The app loads the local pose ONNX model, detects people, estimates pose
-landmarks, and overlays a first-pass `PUT LUGGAGE` action state when the pose
-sequence matches a hand-down, low-hold, release pattern. Events are appended to:
+The app loads the local person-detection and pose-estimation ONNX models,
+detects people, estimates pose landmarks, and runs a lightweight put-luggage
+clip classifier in real time. The classifier uses a 4-second sliding window of
+upper-body keypoint features and overlays `旅客正在放置行李` when the model score
+crosses the threshold. Events are appended to:
 
 ```text
 result/<video_name>_put_luggage_events.jsonl
 ```
 
-This first version recognizes the body posture pattern only. It does not prove
-that a physical bag exists in the frame.
+The bundled action model is:
+
+```text
+models/put_luggage_centroid_model.json
+```
+
+It is a small `nearest_centroid_numpy` baseline trained from locally labeled
+video clips. It does not detect luggage as an object and should be treated as a
+first deployable baseline, not a final high-accuracy production model.
+
+### Put-luggage labeling and training workflow
+
+1. Label fixed-length clips:
+
+```bash
+python label_video_clips.py --video data/2026-08-12_102107_553.mp4
+```
+
+Default clip settings:
+
+```text
+clip_seconds: 4
+stride_seconds: 2
+labels: put_luggage / not_put_luggage / skip
+output: data/clip_labels/labels.csv
+```
+
+Keyboard shortcuts:
+
+```text
+p = put_luggage
+n = not_put_luggage
+s = skip
+b = previous clip
+r = replay current clip
+q = save and quit
+```
+
+2. Extract upper-body keypoint features:
+
+```bash
+python extract_clip_pose_features.py --stride_frames 10
+```
+
+Outputs:
+
+```text
+data/clip_features/features.jsonl
+data/clip_features/quality_report.json
+```
+
+3. Train the lightweight baseline model:
+
+```bash
+python train_clip_classifier.py
+```
+
+Outputs:
+
+```text
+data/clip_classifier_baseline/model.json
+data/clip_classifier_baseline/report.json
+data/clip_classifier_baseline/predictions.csv
+```
+
+Copy the trained model into `models/put_luggage_centroid_model.json` to make
+`pose_app.py` load it at startup. If the JSON model is missing or invalid, the
+app falls back to the older rule-based recognizer.
+
+### Current baseline diagnostics
+
+The bundled model was trained on one labeled local video with 41 usable clips:
+
+```text
+not_put_luggage: 27
+put_luggage: 14
+feature_count: 45
+training accuracy: 0.8049
+put_luggage precision: 0.6875
+put_luggage recall: 0.7857
+```
+
+These numbers are training-set diagnostics on a small, overlapping dataset.
+Add more independent positive and negative clips before treating the model as
+reliable.
+
+### Tests
+
+Run the focused Python tests:
+
+```bash
+python -m unittest \
+  test_label_video_clips.py \
+  test_extract_clip_pose_features.py \
+  test_train_clip_classifier.py \
+  test_pose_model_action_recognizer.py \
+  test_pose_action_recognizer.py
+```
 
 ## License
 
