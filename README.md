@@ -131,6 +131,75 @@ Copy the trained model into `models/put_luggage_centroid_model.json` to make
 `pose_app.py` load it at startup. If the JSON model is missing or invalid, the
 app falls back to the older rule-based recognizer.
 
+### MQTT event publishing
+
+The PyQt app can publish put-luggage events to MQTT. Click `MQTT配置` in
+`pose_app.py`, fill in the broker information, enable MQTT, and save. The app
+stores the setting in:
+
+```text
+mqtt_config.json
+```
+
+The config is loaded automatically on the next startup. MQTT publishing is
+optional; install the extra dependency only when this integration is needed:
+
+```bash
+pip install paho-mqtt
+```
+
+Published messages use JSON and include the event time, action text, action
+code, ROI number, confidence, frame index, video timestamp, and source. Example:
+
+```json
+{
+  "time": "2026-08-27T10:30:12.123+08:00",
+  "action": "旅客正在放置行李",
+  "action_code": "put_luggage",
+  "roi_id": 1,
+  "confidence": 0.82,
+  "frame_idx": 123,
+  "timestamp_ms": 4560,
+  "source": "rtsp://camera/main"
+}
+```
+
+When no ROI is configured, `roi_id` is `FULL`. When multiple ROIs are
+configured, each ROI runs an independent action recognizer and publishes its
+own ROI number.
+
+### RTSP / RTMP input
+
+Click `数据来源` in `pose_app.py` to configure the input source. The app supports:
+
+```text
+file: local video file
+rtsp: rtsp://...
+rtmp: rtmp://...
+```
+
+The source setting is stored in:
+
+```text
+source_config.json
+```
+
+On the next startup, the saved source is loaded automatically. For RTSP/RTMP,
+click `Open Video` to open the configured stream. For local files, `Open Video`
+still opens the file picker and saves the last selected file path.
+
+The source dialog also includes low-latency settings:
+
+```text
+启用低延迟缓冲: asks OpenCV to keep a smaller capture buffer
+推理间隔帧数: runs detection / pose / action inference every N frames
+```
+
+For smoother RTSP viewing, keep low-latency buffering enabled and increase
+`推理间隔帧数` gradually, for example 3 to 5. The app still displays every read
+frame, and reuses the most recent pose/action overlay on non-inference frames
+to avoid visible frame skipping.
+
 ### Current baseline diagnostics
 
 The bundled model was trained on one labeled local video with 41 usable clips:

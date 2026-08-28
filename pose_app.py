@@ -28,12 +28,15 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QSlider, QStatusBar, QCheckBox,
     QComboBox,
-    QGroupBox, QMessageBox, QDialog
+    QGroupBox, QMessageBox, QDialog, QFormLayout, QLineEdit, QSpinBox,
+    QDialogButtonBox
 )
 
+from app_config import SourceConfig, load_source_config, save_source_config
 from mp_pose import MPPose
 from mp_persondet import MPPersonDet
-from pose_action_recognizer import PutLuggageModelRecognizer, PutLuggageRecognizer
+from mqtt_publisher import MqttConfig, MqttPublisher, load_mqtt_config, save_mqtt_config
+from pose_action_recognizer import ActionResult, PutLuggageModelRecognizer, PutLuggageRecognizer
 
 POSEC3D_AVAILABLE = importlib.util.find_spec("mmaction") is not None
 try:
@@ -156,6 +159,16 @@ def should_show_put_luggage_business_label(
 ROI_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "roi_config.json"
+)
+
+MQTT_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "mqtt_config.json"
+)
+
+SOURCE_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "source_config.json"
 )
 
 PUT_LUGGAGE_MODEL_PATH = os.path.join(
@@ -456,6 +469,110 @@ class RoiDialog(QDialog):
         self._label.setPixmap(canvas)
 
 
+class MqttConfigDialog(QDialog):
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MQTT配置")
+        self.config = config
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.chk_enabled = QCheckBox("启用MQTT发送")
+        self.chk_enabled.setChecked(bool(config.enabled))
+        self.txt_host = QLineEdit(config.host)
+        self.spin_port = QSpinBox()
+        self.spin_port.setRange(1, 65535)
+        self.spin_port.setValue(int(config.port or 1883))
+        self.txt_topic = QLineEdit(config.topic)
+        self.txt_client_id = QLineEdit(config.client_id)
+        self.txt_username = QLineEdit(config.username)
+        self.txt_password = QLineEdit(config.password)
+        self.txt_password.setEchoMode(QLineEdit.Password)
+
+        form.addRow(self.chk_enabled)
+        form.addRow("Broker地址", self.txt_host)
+        form.addRow("端口", self.spin_port)
+        form.addRow("Topic", self.txt_topic)
+        form.addRow("Client ID", self.txt_client_id)
+        form.addRow("用户名", self.txt_username)
+        form.addRow("密码", self.txt_password)
+        root.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def get_config(self):
+        return MqttConfig(
+            enabled=self.chk_enabled.isChecked(),
+            host=self.txt_host.text().strip() or "127.0.0.1",
+            port=int(self.spin_port.value()),
+            topic=self.txt_topic.text().strip() or "pose/put_luggage",
+            client_id=self.txt_client_id.text().strip() or "pose-action-client",
+            username=self.txt_username.text().strip(),
+            password=self.txt_password.text(),
+        )
+
+
+class SourceConfigDialog(QDialog):
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("数据来源配置")
+        self.config = config
+
+        root = QVBoxLayout(self)
+        form = QFormLayout()
+        self.cbo_type = QComboBox()
+        self.cbo_type.addItem("本地视频文件", "file")
+        self.cbo_type.addItem("RTSP取流地址", "rtsp")
+        self.cbo_type.addItem("RTMP取流地址", "rtmp")
+        index = self.cbo_type.findData(config.source_type)
+        self.cbo_type.setCurrentIndex(index if index >= 0 else 0)
+        self.txt_source = QLineEdit(config.path_or_url)
+        self.btn_browse = QPushButton("浏览")
+        source_row = QHBoxLayout()
+        source_row.addWidget(self.txt_source, 1)
+        source_row.addWidget(self.btn_browse)
+        self.chk_low_latency = QCheckBox("启用低延迟缓冲")
+        self.chk_low_latency.setChecked(bool(config.low_latency))
+        self.spin_infer_stride = QSpinBox()
+        self.spin_infer_stride.setRange(1, 10)
+        self.spin_infer_stride.setValue(max(1, int(config.infer_stride or 3)))
+
+        form.addRow("来源类型", self.cbo_type)
+        form.addRow("路径/地址", source_row)
+        form.addRow(self.chk_low_latency)
+        form.addRow("推理间隔帧数", self.spin_infer_stride)
+        root.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.cbo_type.currentIndexChanged.connect(self._on_type_changed)
+        self.btn_browse.clicked.connect(self._browse_file)
+        self._on_type_changed()
+
+    def get_config(self):
+        return SourceConfig(
+            source_type=self.cbo_type.currentData() or "file",
+            path_or_url=self.txt_source.text().strip(),
+            low_latency=self.chk_low_latency.isChecked(),
+            infer_stride=int(self.spin_infer_stride.value()),
+        )
+
+    def _on_type_changed(self):
+        self.btn_browse.setEnabled((self.cbo_type.currentData() or "file") == "file")
+
+    def _browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择本地视频", "",
+            "Video Files (*.mp4 *.avi *.mov *.mkv *.flv *.webm);;All Files (*)")
+        if path:
+            self.txt_source.setText(path)
+
 
 class PoseVideoThread(QThread):
     """Background thread that reads frames and runs pose estimation."""
@@ -467,6 +584,7 @@ class PoseVideoThread(QThread):
                  conf_threshold=0.5, show_skeleton=True, show_points=True,
                  show_mask=False, show_bbox=False, rois=None,
                  recognizer_kind="rule", recognizer_options=None,
+                 mqtt_publisher=None, low_latency=False, infer_stride=3,
                  parent=None):
         super().__init__(parent)
         self.video_path = video_path
@@ -488,9 +606,13 @@ class PoseVideoThread(QThread):
         self.cap = None
         self._seek_frame = None  # frame index to seek to (None = no pending seek)
         self.action_recognizer = None
+        self.action_recognizers = {}
         self.event_log_path = self._make_event_log_path(video_path)
         self._event_log = None
         self._recognizer_device = self.recognizer_options.get("device", "")
+        self.mqtt_publisher = mqtt_publisher
+        self.low_latency = bool(low_latency)
+        self.infer_stride = max(1, int(infer_stride))
 
     def seek_to(self, frame_idx):
         """Request the thread to jump to a given frame index."""
@@ -502,6 +624,11 @@ class PoseVideoThread(QThread):
             if not self.cap.isOpened():
                 self.error.emit("Cannot open video: {}".format(self.video_path))
                 return
+            if self.low_latency:
+                try:
+                    self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
             total = int(self.cap.get(cv.CAP_PROP_FRAME_COUNT))
             # Frame interval in ms; fall back to 30 fps if metadata missing.
             fps = self.cap.get(cv.CAP_PROP_FPS)
@@ -509,7 +636,12 @@ class PoseVideoThread(QThread):
                 fps = float(fps) if fps and float(fps) > 0 else 30.0
             except (TypeError, ValueError):
                 fps = 30.0
-            self.action_recognizer = self._build_recognizer(fps)
+            self.action_recognizers = {}
+            self.action_recognizer = self._recognizer_for_roi("FULL", fps)
+            last_action_result = ActionResult("idle", 0.0, "IDLE")
+            last_poses = []
+            last_total_persons = 0
+            last_infer_ms = 0.0
             frame_interval_ms = int(1000.0 / fps)
             self._open_event_log()
 
@@ -546,63 +678,80 @@ class PoseVideoThread(QThread):
                 frame_h, frame_w = frame.shape[:2]
                 rois_val = list(self.rois) if self.rois else []
                 poses = []
+                poses_by_roi = {}
                 total_persons = 0
+                should_infer = (frame_idx % self.infer_stride) == 0
                 # List of (roi_number, (x1, y1, x2, y2)) for drawing.
                 active_roi_rects = []
+                for idx, roi_val in enumerate(rois_val):
+                    if roi_val is None or len(roi_val) != 4:
+                        continue
+                    rx, ry, rw, rh = [int(v) for v in roi_val]
+                    x1 = max(0, min(rx, frame_w - 1))
+                    y1 = max(0, min(ry, frame_h - 1))
+                    x2 = max(0, min(rx + rw, frame_w))
+                    y2 = max(0, min(ry + rh, frame_h))
+                    if x2 - x1 >= 2 and y2 - y1 >= 2:
+                        active_roi_rects.append((idx + 1, (x1, y1, x2, y2)))
 
-                if not rois_val:
-                    # No ROI: process the full frame.
-                    persons = self._detect_persons(frame)
-                    total_persons += len(persons)
-                    for person in persons:
-                        pose = self._infer_pose(frame, person)
-                        if pose is not None:
-                            poses.append(pose)
-                else:
-                    for idx, roi_val in enumerate(rois_val):
-                        if roi_val is None or len(roi_val) != 4:
-                            continue
-                        rx, ry, rw, rh = [int(v) for v in roi_val]
-                        x1 = max(0, min(rx, frame_w - 1))
-                        y1 = max(0, min(ry, frame_h - 1))
-                        x2 = max(0, min(rx + rw, frame_w))
-                        y2 = max(0, min(ry + rh, frame_h))
-                        if x2 - x1 < 2 or y2 - y1 < 2:
-                            continue
-                        detect_frame = frame[y1:y2, x1:x2]
-                        roi_rect = (x1, y1, x2, y2)
-                        active_roi_rects.append((idx + 1, roi_rect))
-                        persons = self._detect_persons(detect_frame)
+                if should_infer:
+                    if not rois_val:
+                        # No ROI: process the full frame.
+                        persons = self._detect_persons(frame)
                         total_persons += len(persons)
                         for person in persons:
-                            pose = self._infer_pose(detect_frame, person)
+                            pose = self._infer_pose(frame, person)
                             if pose is not None:
-                                pose = self._offset_pose(pose, roi_rect, frame_h, frame_w)
                                 poses.append(pose)
+                        poses_by_roi["FULL"] = list(poses)
+                    else:
+                        for roi_id, (x1, y1, x2, y2) in active_roi_rects:
+                            detect_frame = frame[y1:y2, x1:x2]
+                            roi_rect = (x1, y1, x2, y2)
+                            persons = self._detect_persons(detect_frame)
+                            total_persons += len(persons)
+                            roi_poses = []
+                            for person in persons:
+                                pose = self._infer_pose(detect_frame, person)
+                                if pose is not None:
+                                    pose = self._offset_pose(pose, roi_rect, frame_h, frame_w)
+                                poses.append(pose)
+                                roi_poses.append(pose)
+                            poses_by_roi[roi_id] = roi_poses
+                    last_poses = list(poses)
+                    last_total_persons = total_persons
                 tm.stop()
-                infer_ms = (time.time() - iter_start) * 1000.0
+                if should_infer:
+                    last_infer_ms = (time.time() - iter_start) * 1000.0
 
                 display = draw_stickman(
-                    frame, poses,
+                    frame, last_poses,
                     show_skeleton=self.show_skeleton,
                     show_points=self.show_points,
                     show_mask=self.show_mask,
                     show_bbox=self.show_bbox,
                 )
                 timestamp_ms = int(frame_idx * 1000.0 / fps)
-                if self.recognizer_kind == "posec3d":
-                    action_result = self.action_recognizer.update(
-                        poses,
-                        frame_idx=frame_idx,
-                        img_shape=(frame_h, frame_w),
-                        timestamp_ms=timestamp_ms,
-                    )
-                else:
-                    action_result = self.action_recognizer.update(
-                        poses, frame_idx=frame_idx, timestamp_ms=timestamp_ms)
-                for event in action_result.events:
-                    self._write_action_event(event)
-                self._draw_action_overlay(display, action_result)
+                if should_infer:
+                    action_results = []
+                    for roi_id, roi_poses in poses_by_roi.items():
+                        recognizer = self._recognizer_for_roi(roi_id, fps)
+                        if self.recognizer_kind == "posec3d":
+                            action_result = recognizer.update(
+                                roi_poses,
+                                frame_idx=frame_idx,
+                                img_shape=(frame_h, frame_w),
+                                timestamp_ms=timestamp_ms,
+                            )
+                        else:
+                            action_result = recognizer.update(
+                                roi_poses, frame_idx=frame_idx, timestamp_ms=timestamp_ms)
+                        for event in action_result.events:
+                            event["roi_id"] = roi_id
+                            self._write_action_event(event)
+                        action_results.append(action_result)
+                    last_action_result = self._merge_action_results(action_results)
+                self._draw_action_overlay(display, last_action_result)
 
                 # Draw every active ROI rectangle with its 1-based number.
                 for roi_num, (rx1, ry1, rx2, ry2) in active_roi_rects:
@@ -618,7 +767,7 @@ class PoseVideoThread(QThread):
                                (10, 25), cv.FONT_HERSHEY_SIMPLEX, 0.6,
                                (0, 255, 255), 1, cv.LINE_AA)
                 cv.putText(display,
-                           "detected:{}  poses:{}".format(total_persons, len(poses)),
+                           "detected:{}  poses:{}".format(last_total_persons, len(last_poses)),
                            (10, 50), cv.FONT_HERSHEY_SIMPLEX, 0.6,
                            (0, 255, 255), 1, cv.LINE_AA)
                 roi_text = "ROI:{}".format(len(rois_val)) if rois_val else "ROI:FULL"
@@ -628,7 +777,7 @@ class PoseVideoThread(QThread):
                 cv.putText(
                     display,
                     "{}  {}  infer:{:.0f}ms".format(
-                        roi_text, recognizer_text, infer_ms),
+                        roi_text, recognizer_text, last_infer_ms),
                     (10, 75), cv.FONT_HERSHEY_SIMPLEX, 0.6,
                     (0, 255, 255), 1, cv.LINE_AA)
 
@@ -647,8 +796,25 @@ class PoseVideoThread(QThread):
             self.error.emit(str(e))
         finally:
             self._close_event_log()
+            if self.mqtt_publisher is not None:
+                self.mqtt_publisher.close()
             if self.cap is not None:
                 self.cap.release()
+
+    def _recognizer_for_roi(self, roi_id, fps):
+        key = str(roi_id)
+        if key not in self.action_recognizers:
+            self.action_recognizers[key] = self._build_recognizer(fps)
+        return self.action_recognizers[key]
+
+    @staticmethod
+    def _merge_action_results(results):
+        results = [item for item in results if item is not None]
+        if not results:
+            return ActionResult("not_ready", 0.0, "NO ACTION")
+        put_results = [item for item in results if item.state == "put_luggage"]
+        candidates = put_results or results
+        return max(candidates, key=lambda item: float(item.confidence or 0.0))
 
     def _build_recognizer(self, fps):
         if self.recognizer_kind == "clip_model":
@@ -705,6 +871,10 @@ class PoseVideoThread(QThread):
         if self._event_log is not None:
             self._event_log.write(json.dumps(payload, ensure_ascii=False) + "\n")
             self._event_log.flush()
+        if self.mqtt_publisher is not None:
+            roi_id = payload.get("roi_id")
+            self.mqtt_publisher.publish_action(
+                payload, roi_id=roi_id, video_path=self.video_path)
 
     @staticmethod
     def _draw_action_overlay(display, action_result):
@@ -838,6 +1008,8 @@ class PoseMainWindow(QMainWindow):
         self.video_frame_size = None
         self.current_frame = None
         self.recognizer_kind = "clip_model" if os.path.isfile(PUT_LUGGAGE_MODEL_PATH) else "rule"
+        self.mqtt_config = load_mqtt_config(MQTT_CONFIG_PATH)
+        self.source_config = load_source_config(SOURCE_CONFIG_PATH)
         # List of ROI rectangles (x, y, w, h) in original frame coords.
         self.rois = []
         self.roi_frame_size = None
@@ -860,6 +1032,8 @@ class PoseMainWindow(QMainWindow):
         self.btn_pause = QPushButton("Pause")
         self.btn_stop = QPushButton("Stop")
         self.btn_select_model = QPushButton("Select Pose ONNX")
+        self.btn_source = QPushButton("数据来源")
+        self.btn_mqtt = QPushButton("MQTT配置")
         self.cbo_recognizer = QComboBox()
         self.btn_select_roi = QPushButton("框选ROI")
         self.btn_save_roi = QPushButton("保存ROI")
@@ -871,6 +1045,8 @@ class PoseMainWindow(QMainWindow):
         bar.addWidget(self.btn_pause)
         bar.addWidget(self.btn_stop)
         bar.addWidget(self.btn_select_model)
+        bar.addWidget(self.btn_source)
+        bar.addWidget(self.btn_mqtt)
         self.cbo_recognizer.addItem("ClipModel")
         self.cbo_recognizer.addItem("Rule")
         self.cbo_recognizer.addItem("PoseC3D")
@@ -934,6 +1110,8 @@ class PoseMainWindow(QMainWindow):
         self.btn_pause.clicked.connect(self._pause)
         self.btn_stop.clicked.connect(self._stop)
         self.btn_select_model.clicked.connect(self._select_pose_model)
+        self.btn_source.clicked.connect(self._configure_source)
+        self.btn_mqtt.clicked.connect(self._configure_mqtt)
         self.cbo_recognizer.currentIndexChanged.connect(self._on_recognizer_changed)
         self.btn_select_roi.clicked.connect(self._select_roi)
         self.btn_save_roi.clicked.connect(self._save_rois)
@@ -1059,9 +1237,18 @@ class PoseMainWindow(QMainWindow):
         if self.pose_estimator is None or self.person_detector is None:
             QMessageBox.warning(self, "Not ready", "Models are not loaded.")
             return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Video", "",
-            "Video Files (*.mp4 *.avi *.mov *.mkv *.flv *.webm);;All Files (*)")
+        source_type = self.source_config.source_type
+        path = self.source_config.path_or_url if source_type in ("rtsp", "rtmp") else ""
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Open Video", self.source_config.path_or_url or "",
+                "Video Files (*.mp4 *.avi *.mov *.mkv *.flv *.webm);;All Files (*)")
+            if path:
+                self.source_config = SourceConfig("file", path)
+                try:
+                    save_source_config(self.source_config, SOURCE_CONFIG_PATH)
+                except Exception as e:
+                    print("[pose_app] failed to save source config:", e, file=sys.stderr)
         if not path:
             return
         self.video_path = path
@@ -1073,13 +1260,18 @@ class PoseMainWindow(QMainWindow):
         total = int(cap.get(cv.CAP_PROP_FRAME_COUNT))
         frame_w = int(cap.get(cv.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv.CAP_PROP_FRAME_HEIGHT))
+        if frame_w <= 0 or frame_h <= 0:
+            ok, probe_frame = cap.read()
+            if ok and probe_frame is not None:
+                frame_h, frame_w = probe_frame.shape[:2]
         cap.release()
         self.video_frame_size = (frame_w, frame_h)
-        self._validate_rois_for_video(frame_w, frame_h)
+        if frame_w > 0 and frame_h > 0:
+            self._validate_rois_for_video(frame_w, frame_h)
         self.slider.setEnabled(total > 0)
         self.slider.setMaximum(max(total - 1, 0))
         self.slider.setValue(0)
-        self.lbl_info.setText(os.path.basename(path))
+        self.lbl_info.setText(self._source_display_name(path))
         self.btn_select_roi.setEnabled(True)
         if self.rois:
             self.status.showMessage("Loaded: {} | ROI: {} 个".format(path, len(self.rois)))
@@ -1108,6 +1300,9 @@ class PoseMainWindow(QMainWindow):
                 "device": default_posec3d_device(),
                 "predict_interval": 12,
             },
+            mqtt_publisher=MqttPublisher(self.mqtt_config) if self.mqtt_config.enabled else None,
+            low_latency=self.source_config.low_latency,
+            infer_stride=self.source_config.infer_stride,
         )
         self.thread.frame_ready.connect(self._on_frame)
         self.thread.finished_video.connect(self._on_finished)
@@ -1173,6 +1368,51 @@ class PoseMainWindow(QMainWindow):
             self.thread.show_points = self.chk_points.isChecked()
             self.thread.show_mask = self.chk_mask.isChecked()
             self.thread.show_bbox = self.chk_bbox.isChecked()
+
+    def _configure_mqtt(self):
+        dlg = MqttConfigDialog(self.mqtt_config, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        config = dlg.get_config()
+        try:
+            save_mqtt_config(config, MQTT_CONFIG_PATH)
+        except Exception as e:
+            QMessageBox.critical(self, "MQTT保存失败", str(e))
+            return
+        self.mqtt_config = config
+        status = "MQTT 已启用: {}:{} -> {}".format(
+            config.host, config.port, config.topic) if config.enabled else "MQTT 已禁用"
+        self.status.showMessage(status)
+        QMessageBox.information(self, "MQTT配置", "配置已保存，下次启动将自动读取。")
+
+    def _configure_source(self):
+        dlg = SourceConfigDialog(self.source_config, parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        config = dlg.get_config()
+        try:
+            save_source_config(config, SOURCE_CONFIG_PATH)
+        except Exception as e:
+            QMessageBox.critical(self, "数据来源保存失败", str(e))
+            return
+        if self.thread is not None and self.thread.isRunning():
+            self._stop()
+        self.source_config = config
+        self.video_path = config.path_or_url if config.path_or_url else None
+        self.lbl_info.setText(self._source_display_name(config.path_or_url) if config.path_or_url else "No video loaded")
+        self.btn_play.setEnabled(False)
+        self.status.showMessage(
+            "数据来源已保存: {} | 低延迟:{} | 跳帧:{}"
+            .format(config.source_type.upper(), "开" if config.low_latency else "关", config.infer_stride))
+
+    @staticmethod
+    def _source_display_name(path_or_url):
+        if not path_or_url:
+            return "No video loaded"
+        lower = path_or_url.lower()
+        if lower.startswith("rtsp://") or lower.startswith("rtmp://"):
+            return path_or_url
+        return os.path.basename(path_or_url)
 
     # ---- ROI ------------------------------------------------------------
     def _load_rois(self):
