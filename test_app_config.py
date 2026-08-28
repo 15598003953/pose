@@ -25,6 +25,8 @@ class SourceConfigTest(unittest.TestCase):
                 path_or_url="rtsp://127.0.0.1/live",
                 low_latency=True,
                 infer_stride=3,
+                display_fps=15,
+                infer_interval_ms=300,
             )
 
             save_source_config(expected, path)
@@ -50,6 +52,8 @@ class SourceConfigTest(unittest.TestCase):
                 path_or_url="rtsp://127.0.0.1/live",
                 low_latency=False,
                 infer_stride=5,
+                display_fps=20,
+                infer_interval_ms=500,
             )
 
             save_source_config(expected, path)
@@ -57,6 +61,8 @@ class SourceConfigTest(unittest.TestCase):
 
         self.assertFalse(actual.low_latency)
         self.assertEqual(5, actual.infer_stride)
+        self.assertEqual(20, actual.display_fps)
+        self.assertEqual(500, actual.infer_interval_ms)
 
 
 if __name__ == "__main__":

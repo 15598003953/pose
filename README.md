@@ -191,14 +191,17 @@ still opens the file picker and saves the last selected file path.
 The source dialog also includes low-latency settings:
 
 ```text
-启用低延迟缓冲: asks OpenCV to keep a smaller capture buffer
-推理间隔帧数: runs detection / pose / action inference every N frames
+启用低延迟缓冲: RTSP/RTMP uses a background latest-frame reader
+推理间隔帧数: local-file mode runs inference every N frames
+显示FPS: RTSP/RTMP display refresh rate
+推理间隔毫秒: RTSP/RTMP detection / pose / action inference interval
 ```
 
 For smoother RTSP viewing, keep low-latency buffering enabled and increase
-`推理间隔帧数` gradually, for example 3 to 5. The app still displays every read
-frame, and reuses the most recent pose/action overlay on non-inference frames
-to avoid visible frame skipping.
+`推理间隔毫秒` gradually, for example 300 to 500 ms. In RTSP/RTMP mode, the app
+keeps only the newest camera frame, refreshes the display at the configured
+display FPS, and runs inference in a background worker. Slow inference lowers
+recognition refresh rate but should not block video display.
 
 ### Current baseline diagnostics
 

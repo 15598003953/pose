@@ -14,6 +14,7 @@ import sys
 import time
 import json
 import uuid
+import threading
 import numpy as np
 import cv2 as cv
 
@@ -33,6 +34,7 @@ from PyQt5.QtWidgets import (
 )
 
 from app_config import SourceConfig, load_source_config, save_source_config
+from latest_frame_capture import LatestFrameCapture
 from mp_pose import MPPose
 from mp_persondet import MPPersonDet
 from mqtt_publisher import MqttConfig, MqttPublisher, load_mqtt_config, save_mqtt_config
@@ -154,6 +156,11 @@ def should_show_put_luggage_business_label(
     except (TypeError, ValueError):
         score = 0.0
     return str(state).strip().lower() in POSEC3D_PUT_LUGGAGE_LABELS and score >= threshold
+
+
+def is_stream_source(source):
+    lower = str(source or "").lower()
+    return lower.startswith("rtsp://") or lower.startswith("rtmp://")
 
 # JSON file that stores the ROI rectangle (x, y, w, h). Loaded on startup.
 ROI_CONFIG_PATH = os.path.join(
@@ -539,11 +546,20 @@ class SourceConfigDialog(QDialog):
         self.spin_infer_stride = QSpinBox()
         self.spin_infer_stride.setRange(1, 10)
         self.spin_infer_stride.setValue(max(1, int(config.infer_stride or 3)))
+        self.spin_display_fps = QSpinBox()
+        self.spin_display_fps.setRange(1, 30)
+        self.spin_display_fps.setValue(max(1, int(config.display_fps or 15)))
+        self.spin_infer_interval = QSpinBox()
+        self.spin_infer_interval.setRange(50, 5000)
+        self.spin_infer_interval.setSingleStep(50)
+        self.spin_infer_interval.setValue(max(50, int(config.infer_interval_ms or 300)))
 
         form.addRow("来源类型", self.cbo_type)
         form.addRow("路径/地址", source_row)
         form.addRow(self.chk_low_latency)
         form.addRow("推理间隔帧数", self.spin_infer_stride)
+        form.addRow("显示FPS", self.spin_display_fps)
+        form.addRow("推理间隔毫秒", self.spin_infer_interval)
         root.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -561,6 +577,8 @@ class SourceConfigDialog(QDialog):
             path_or_url=self.txt_source.text().strip(),
             low_latency=self.chk_low_latency.isChecked(),
             infer_stride=int(self.spin_infer_stride.value()),
+            display_fps=int(self.spin_display_fps.value()),
+            infer_interval_ms=int(self.spin_infer_interval.value()),
         )
 
     def _on_type_changed(self):
@@ -604,6 +622,7 @@ class PoseVideoThread(QThread):
         self._running = True
         self._pause = False
         self.cap = None
+        self.latest_capture = None
         self._seek_frame = None  # frame index to seek to (None = no pending seek)
         self.action_recognizer = None
         self.action_recognizers = {}
@@ -613,6 +632,16 @@ class PoseVideoThread(QThread):
         self.mqtt_publisher = mqtt_publisher
         self.low_latency = bool(low_latency)
         self.infer_stride = max(1, int(infer_stride))
+        self.display_fps = max(1, int(self.recognizer_options.get("display_fps", 15)))
+        self.infer_interval_ms = max(50, int(self.recognizer_options.get("infer_interval_ms", 300)))
+        self._infer_lock = threading.Lock()
+        self._infer_running = False
+        self._infer_thread = None
+        self._last_overlay_poses = []
+        self._last_action_result = ActionResult("idle", 0.0, "IDLE")
+        self._last_total_persons = 0
+        self._last_infer_ms = 0.0
+        self._event_lock = threading.Lock()
 
     def seek_to(self, frame_idx):
         """Request the thread to jump to a given frame index."""
@@ -620,16 +649,25 @@ class PoseVideoThread(QThread):
 
     def run(self):
         try:
-            self.cap = cv.VideoCapture(self.video_path)
-            if not self.cap.isOpened():
-                self.error.emit("Cannot open video: {}".format(self.video_path))
-                return
-            if self.low_latency:
-                try:
-                    self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
-                except Exception:
-                    pass
-            total = int(self.cap.get(cv.CAP_PROP_FRAME_COUNT))
+            use_stream_loop = self.low_latency and is_stream_source(self.video_path)
+            if use_stream_loop:
+                self.latest_capture = LatestFrameCapture(self.video_path)
+                if not self.latest_capture.open():
+                    self.error.emit(self.latest_capture.error)
+                    return
+                self.latest_capture.start()
+                self.cap = self.latest_capture.cap
+            else:
+                self.cap = cv.VideoCapture(self.video_path)
+                if not self.cap.isOpened():
+                    self.error.emit("Cannot open video: {}".format(self.video_path))
+                    return
+                if self.low_latency:
+                    try:
+                        self.cap.set(cv.CAP_PROP_BUFFERSIZE, 1)
+                    except Exception:
+                        pass
+            total = 0 if use_stream_loop else int(self.cap.get(cv.CAP_PROP_FRAME_COUNT))
             # Frame interval in ms; fall back to 30 fps if metadata missing.
             fps = self.cap.get(cv.CAP_PROP_FPS)
             try:
@@ -644,6 +682,10 @@ class PoseVideoThread(QThread):
             last_infer_ms = 0.0
             frame_interval_ms = int(1000.0 / fps)
             self._open_event_log()
+
+            if use_stream_loop:
+                self._run_stream_display_loop(fps)
+                return
 
             tm = cv.TickMeter()
             frame_idx = 0
@@ -795,11 +837,181 @@ class PoseVideoThread(QThread):
         except Exception as e:
             self.error.emit(str(e))
         finally:
+            self._wait_for_inference()
             self._close_event_log()
             if self.mqtt_publisher is not None:
                 self.mqtt_publisher.close()
-            if self.cap is not None:
+            if self.latest_capture is not None:
+                self.latest_capture.stop()
+            elif self.cap is not None:
                 self.cap.release()
+
+    def _run_stream_display_loop(self, fps):
+        display_interval_ms = int(1000.0 / max(1, self.display_fps))
+        last_infer_request_ms = 0
+        last_displayed_idx = -1
+        tm = cv.TickMeter()
+
+        while self._running:
+            if self._pause:
+                self.msleep(30)
+                continue
+
+            latest = self.latest_capture.get_latest() if self.latest_capture else None
+            if latest is None or latest.frame_idx == last_displayed_idx:
+                self.msleep(5)
+                continue
+
+            frame = latest.frame
+            frame_idx = latest.frame_idx
+            last_displayed_idx = frame_idx
+            frame_h, frame_w = frame.shape[:2]
+            now_ms = int(time.time() * 1000)
+            if now_ms - last_infer_request_ms >= self.infer_interval_ms:
+                started = self._start_async_inference(
+                    frame.copy(), frame_idx, fps, frame_h, frame_w)
+                if started:
+                    last_infer_request_ms = now_ms
+
+            tm.start()
+            with self._infer_lock:
+                poses = list(self._last_overlay_poses)
+                action_result = self._last_action_result
+                total_persons = self._last_total_persons
+                infer_ms = self._last_infer_ms
+            display = draw_stickman(
+                frame,
+                poses,
+                show_skeleton=self.show_skeleton,
+                show_points=self.show_points,
+                show_mask=self.show_mask,
+                show_bbox=self.show_bbox,
+            )
+            self._draw_action_overlay(display, action_result)
+            active_roi_rects = self._active_roi_rects(frame_w, frame_h)
+            for roi_num, (rx1, ry1, rx2, ry2) in active_roi_rects:
+                cv.rectangle(display, (rx1, ry1), (rx2 - 1, ry2 - 1),
+                             (255, 0, 0), 2, cv.LINE_AA)
+                cv.putText(display, "ROI{}".format(roi_num),
+                           (rx1 + 4, ry1 + 18),
+                           cv.FONT_HERSHEY_SIMPLEX, 0.6,
+                           (255, 0, 0), 1, cv.LINE_AA)
+            cv.putText(display, "Frame {}".format(frame_idx + 1),
+                       (10, 25), cv.FONT_HERSHEY_SIMPLEX, 0.6,
+                       (0, 255, 255), 1, cv.LINE_AA)
+            cv.putText(display,
+                       "detected:{}  poses:{}".format(total_persons, len(poses)),
+                       (10, 50), cv.FONT_HERSHEY_SIMPLEX, 0.6,
+                       (0, 255, 255), 1, cv.LINE_AA)
+            roi_text = "ROI:{}".format(len(self.rois)) if self.rois else "ROI:FULL"
+            cv.putText(
+                display,
+                "{}  {}  infer:{:.0f}ms async".format(
+                    roi_text, self.recognizer_kind, infer_ms),
+                (10, 75), cv.FONT_HERSHEY_SIMPLEX, 0.6,
+                (0, 255, 255), 1, cv.LINE_AA)
+            tm.stop()
+            self.frame_ready.emit(display, tm.getFPS(), frame_idx, 0)
+            tm.reset()
+            self.msleep(display_interval_ms)
+
+        self.finished_video.emit()
+
+    def _start_async_inference(self, frame, frame_idx, fps, frame_h, frame_w):
+        with self._infer_lock:
+            if self._infer_running:
+                return False
+            self._infer_running = True
+        worker = threading.Thread(
+            target=self._async_inference_worker,
+            args=(frame, frame_idx, fps, frame_h, frame_w),
+            daemon=True,
+        )
+        self._infer_thread = worker
+        worker.start()
+        return True
+
+    def _wait_for_inference(self):
+        worker = self._infer_thread
+        if worker is not None and worker.is_alive():
+            worker.join(timeout=2.0)
+
+    def _async_inference_worker(self, frame, frame_idx, fps, frame_h, frame_w):
+        start = time.time()
+        try:
+            poses, poses_by_roi, total_persons = self._infer_frame(frame, frame_h, frame_w)
+            timestamp_ms = int(frame_idx * 1000.0 / fps)
+            action_results = []
+            for roi_id, roi_poses in poses_by_roi.items():
+                recognizer = self._recognizer_for_roi(roi_id, fps)
+                if self.recognizer_kind == "posec3d":
+                    action_result = recognizer.update(
+                        roi_poses,
+                        frame_idx=frame_idx,
+                        img_shape=(frame_h, frame_w),
+                        timestamp_ms=timestamp_ms,
+                    )
+                else:
+                    action_result = recognizer.update(
+                        roi_poses, frame_idx=frame_idx, timestamp_ms=timestamp_ms)
+                for event in action_result.events:
+                    event["roi_id"] = roi_id
+                    self._write_action_event(event)
+                action_results.append(action_result)
+            merged = self._merge_action_results(action_results)
+            infer_ms = (time.time() - start) * 1000.0
+            with self._infer_lock:
+                self._last_overlay_poses = list(poses)
+                self._last_action_result = merged
+                self._last_total_persons = total_persons
+                self._last_infer_ms = infer_ms
+        finally:
+            with self._infer_lock:
+                self._infer_running = False
+
+    def _infer_frame(self, frame, frame_h, frame_w):
+        rois_val = list(self.rois) if self.rois else []
+        poses = []
+        poses_by_roi = {}
+        total_persons = 0
+        if not rois_val:
+            persons = self._detect_persons(frame)
+            total_persons += len(persons)
+            for person in persons:
+                pose = self._infer_pose(frame, person)
+                if pose is not None:
+                    poses.append(pose)
+            poses_by_roi["FULL"] = list(poses)
+            return poses, poses_by_roi, total_persons
+
+        for roi_id, (x1, y1, x2, y2) in self._active_roi_rects(frame_w, frame_h):
+            detect_frame = frame[y1:y2, x1:x2]
+            roi_rect = (x1, y1, x2, y2)
+            persons = self._detect_persons(detect_frame)
+            total_persons += len(persons)
+            roi_poses = []
+            for person in persons:
+                pose = self._infer_pose(detect_frame, person)
+                if pose is not None:
+                    pose = self._offset_pose(pose, roi_rect, frame_h, frame_w)
+                    poses.append(pose)
+                    roi_poses.append(pose)
+            poses_by_roi[roi_id] = roi_poses
+        return poses, poses_by_roi, total_persons
+
+    def _active_roi_rects(self, frame_w, frame_h):
+        rects = []
+        for idx, roi_val in enumerate(list(self.rois) if self.rois else []):
+            if roi_val is None or len(roi_val) != 4:
+                continue
+            rx, ry, rw, rh = [int(v) for v in roi_val]
+            x1 = max(0, min(rx, frame_w - 1))
+            y1 = max(0, min(ry, frame_h - 1))
+            x2 = max(0, min(rx + rw, frame_w))
+            y2 = max(0, min(ry + rh, frame_h))
+            if x2 - x1 >= 2 and y2 - y1 >= 2:
+                rects.append((idx + 1, (x1, y1, x2, y2)))
+        return rects
 
     def _recognizer_for_roi(self, roi_id, fps):
         key = str(roi_id)
@@ -859,22 +1071,24 @@ class PoseVideoThread(QThread):
         self._event_log = open(self.event_log_path, "a", encoding="utf-8")
 
     def _close_event_log(self):
-        if self._event_log is not None:
-            self._event_log.close()
-            self._event_log = None
+        with self._event_lock:
+            if self._event_log is not None:
+                self._event_log.close()
+                self._event_log = None
 
     def _write_action_event(self, event):
         payload = dict(event)
         payload["event_id"] = str(uuid.uuid4())
         payload["video_path"] = self.video_path
         payload["log_time_ms"] = int(time.time() * 1000)
-        if self._event_log is not None:
-            self._event_log.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            self._event_log.flush()
-        if self.mqtt_publisher is not None:
-            roi_id = payload.get("roi_id")
-            self.mqtt_publisher.publish_action(
-                payload, roi_id=roi_id, video_path=self.video_path)
+        with self._event_lock:
+            if self._event_log is not None:
+                self._event_log.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                self._event_log.flush()
+            if self.mqtt_publisher is not None:
+                roi_id = payload.get("roi_id")
+                self.mqtt_publisher.publish_action(
+                    payload, roi_id=roi_id, video_path=self.video_path)
 
     @staticmethod
     def _draw_action_overlay(display, action_result):
@@ -1299,6 +1513,8 @@ class PoseMainWindow(QMainWindow):
             recognizer_options={
                 "device": default_posec3d_device(),
                 "predict_interval": 12,
+                "display_fps": self.source_config.display_fps,
+                "infer_interval_ms": self.source_config.infer_interval_ms,
             },
             mqtt_publisher=MqttPublisher(self.mqtt_config) if self.mqtt_config.enabled else None,
             low_latency=self.source_config.low_latency,
@@ -1402,8 +1618,14 @@ class PoseMainWindow(QMainWindow):
         self.lbl_info.setText(self._source_display_name(config.path_or_url) if config.path_or_url else "No video loaded")
         self.btn_play.setEnabled(False)
         self.status.showMessage(
-            "数据来源已保存: {} | 低延迟:{} | 跳帧:{}"
-            .format(config.source_type.upper(), "开" if config.low_latency else "关", config.infer_stride))
+            "数据来源已保存: {} | 低延迟:{} | 跳帧:{} | 显示FPS:{} | 推理:{}ms"
+            .format(
+                config.source_type.upper(),
+                "开" if config.low_latency else "关",
+                config.infer_stride,
+                config.display_fps,
+                config.infer_interval_ms,
+            ))
 
     @staticmethod
     def _source_display_name(path_or_url):

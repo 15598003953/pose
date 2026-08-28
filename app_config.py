@@ -12,6 +12,8 @@ class SourceConfig:
     path_or_url: str = ""
     low_latency: bool = True
     infer_stride: int = 3
+    display_fps: int = 15
+    infer_interval_ms: int = 300
 
 
 def load_source_config(path: Path) -> SourceConfig:
@@ -26,6 +28,13 @@ def load_source_config(path: Path) -> SourceConfig:
     path_or_url = str(payload.get("path_or_url") or "")
     low_latency = bool(payload.get("low_latency", True))
     infer_stride = _safe_stride(payload.get("infer_stride", 3))
+    display_fps = _safe_int(payload.get("display_fps", 15), default=15, min_value=1, max_value=30)
+    infer_interval_ms = _safe_int(
+        payload.get("infer_interval_ms", 300),
+        default=300,
+        min_value=50,
+        max_value=5000,
+    )
     if source_type not in VALID_SOURCE_TYPES:
         return SourceConfig()
     if source_type in {"rtsp", "rtmp"} and not path_or_url.lower().startswith(source_type + "://"):
@@ -35,6 +44,8 @@ def load_source_config(path: Path) -> SourceConfig:
         path_or_url=path_or_url,
         low_latency=low_latency,
         infer_stride=infer_stride,
+        display_fps=display_fps,
+        infer_interval_ms=infer_interval_ms,
     )
 
 
@@ -54,6 +65,13 @@ def save_source_config(config: SourceConfig, path: Path) -> None:
                 path_or_url=path_or_url,
                 low_latency=bool(config.low_latency),
                 infer_stride=_safe_stride(config.infer_stride),
+                display_fps=_safe_int(config.display_fps, default=15, min_value=1, max_value=30),
+                infer_interval_ms=_safe_int(
+                    config.infer_interval_ms,
+                    default=300,
+                    min_value=50,
+                    max_value=5000,
+                ),
             )),
             ensure_ascii=False,
             indent=2,
@@ -68,3 +86,11 @@ def _safe_stride(value):
     except (TypeError, ValueError):
         return 3
     return stride if stride >= 1 else 1
+
+
+def _safe_int(value, default, min_value, max_value):
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(min_value, min(max_value, result))
