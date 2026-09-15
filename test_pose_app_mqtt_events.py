@@ -18,6 +18,12 @@ class FakePublisher:
         self.closed = True
 
 
+class IdleFakePublisher(FakePublisher):
+    def publish_action(self, event, roi_id=None, video_path=""):
+        self.calls.append((dict(event), roi_id, video_path))
+        return True
+
+
 class PoseAppMqttEventTest(unittest.TestCase):
     def test_write_action_event_publishes_roi_id_to_mqtt(self):
         publisher = FakePublisher()
@@ -43,6 +49,22 @@ class PoseAppMqttEventTest(unittest.TestCase):
         event, roi_id, video_path = publisher.calls[0]
         self.assertEqual("put_luggage", event["event"])
         self.assertEqual(3, roi_id)
+        self.assertEqual("rtsp://camera/main", video_path)
+
+    def test_idle_heartbeat_is_published_when_no_action_detected(self):
+        publisher = IdleFakePublisher()
+        thread = PoseVideoThread(
+            "rtsp://camera/main",
+            pose_estimator=None,
+            person_detector=None,
+            mqtt_publisher=publisher,
+        )
+        thread._maybe_publish_idle_heartbeat("FULL")
+
+        self.assertEqual(1, len(publisher.calls))
+        event, roi_id, video_path = publisher.calls[0]
+        self.assertEqual("idle", event["event"])
+        self.assertEqual("FULL", roi_id)
         self.assertEqual("rtsp://camera/main", video_path)
 
 

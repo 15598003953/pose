@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from pose_action_recognizer import PutLuggageModelRecognizer
+from posec3d_action_recognizer import _resolve_label_map_path
 
 
 def _pose(left_wrist_y, right_wrist_y=None, visibility=0.95, presence=0.95):
@@ -69,6 +70,13 @@ class PutLuggageModelRecognizerTest(unittest.TestCase):
         self.assertTrue(result.events)
         self.assertEqual("model_clip_classifier", result.events[0]["reason"])
         self.assertGreater(result.confidence, 0.5)
+
+    def test_resolve_label_map_path_raises_for_missing_explicit_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing_label_map.txt"
+
+            with self.assertRaises(FileNotFoundError):
+                _resolve_label_map_path(str(missing), Path(tmp))
 
 
 if __name__ == "__main__":

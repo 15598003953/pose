@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 from mqtt_publisher import (
@@ -8,6 +9,31 @@ from mqtt_publisher import (
     load_mqtt_config,
     save_mqtt_config,
 )
+
+
+class FakeClient:
+    def __init__(self):
+        self.connected = None
+        self.loop_started = False
+        self.loop_stopped = False
+        self.disconnected = False
+        self.published = []
+
+    def connect(self, host, port, keepalive=30):
+        self.connected = (host, port, keepalive)
+
+    def loop_start(self):
+        self.loop_started = True
+
+    def publish(self, topic, payload, qos=0, retain=False):
+        self.published.append((topic, payload, qos, retain))
+        return SimpleNamespace(rc=0)
+
+    def loop_stop(self):
+        self.loop_stopped = True
+
+    def disconnect(self):
+        self.disconnected = True
 
 
 class MqttPublisherTest(unittest.TestCase):
@@ -65,6 +91,49 @@ class MqttPublisherTest(unittest.TestCase):
             config = load_mqtt_config(path)
 
         self.assertFalse(config.enabled)
+
+    def test_publish_action_strips_wildcards_from_publish_topic(self):
+        client = FakeClient()
+        config = MqttConfig(
+            enabled=True,
+            host="127.0.0.1",
+            port=1883,
+            topic="testtopic/#",
+            client_id="pose-client",
+        )
+        publisher = __import__("mqtt_publisher").MqttPublisher(
+            config,
+            client_factory=lambda client_id: client,
+        )
+
+        ok = publisher.publish_action(
+            {"event": "idle", "confidence": 0.0},
+            roi_id="FULL",
+            video_path="startup",
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual("testtopic", client.published[0][0])
+        self.assertTrue(client.loop_started)
+        self.assertEqual(("127.0.0.1", 1883, 30), client.connected)
+
+    def test_save_mqtt_config_strips_wildcards_from_topic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mqtt_config.json"
+            expected = MqttConfig(
+                enabled=True,
+                host="192.168.1.85",
+                port=1883,
+                topic="testtopic/#",
+                client_id="pose-client",
+            )
+
+            save_mqtt_config(expected, path)
+            actual = load_mqtt_config(path)
+            raw = path.read_text(encoding="utf-8")
+
+        self.assertEqual("testtopic", actual.topic)
+        self.assertNotIn("#", raw)
 
 
 if __name__ == "__main__":

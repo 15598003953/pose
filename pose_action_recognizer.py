@@ -285,8 +285,8 @@ class PutLuggageRecognizer:
         self._best_evidence: Dict[str, float] = {}
         self._last_event_frame = -100000
 
-        self.enter_threshold = 0.62
-        self.release_threshold = 0.60
+        self.enter_threshold = 0.52
+        self.release_threshold = 0.50
         self.min_operation_frames = max(6, int(round(self.fps * 0.8)))
         self.max_operation_frames = max(36, int(round(self.fps * 6.0)))
         self.cooldown_frames = max(12, int(round(self.fps * 2.0)))

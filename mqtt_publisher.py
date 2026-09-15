@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 DEFAULT_TOPIC = "pose/put_luggage"
 PUT_LUGGAGE_ACTION_TEXT = "旅客正在放置行李"
+IDLE_ACTION_TEXT = "idle/heartbeat"
 
 
 @dataclass(eq=True)
@@ -32,7 +33,7 @@ def load_mqtt_config(path: Path) -> MqttConfig:
         enabled=bool(payload.get("enabled", False)),
         host=str(payload.get("host") or "127.0.0.1"),
         port=_safe_port(payload.get("port", 1883)),
-        topic=str(payload.get("topic") or DEFAULT_TOPIC),
+        topic=_sanitize_publish_topic(payload.get("topic") or DEFAULT_TOPIC),
         client_id=str(payload.get("client_id") or "pose-action-client"),
         username=str(payload.get("username") or ""),
         password=str(payload.get("password") or ""),
@@ -42,8 +43,17 @@ def load_mqtt_config(path: Path) -> MqttConfig:
 def save_mqtt_config(config: MqttConfig, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    normalized = MqttConfig(
+        enabled=bool(config.enabled),
+        host=str(config.host or "127.0.0.1"),
+        port=_safe_port(config.port),
+        topic=_sanitize_publish_topic(config.topic),
+        client_id=str(config.client_id or "pose-action-client"),
+        username=str(config.username or ""),
+        password=str(config.password or ""),
+    )
     path.write_text(
-        json.dumps(asdict(config), ensure_ascii=False, indent=2),
+        json.dumps(asdict(normalized), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -53,7 +63,11 @@ def build_action_payload(
         roi_id: Any = None,
         video_path: str = "") -> Dict[str, Any]:
     action_code = str(event.get("event") or event.get("state") or "")
-    action = PUT_LUGGAGE_ACTION_TEXT if action_code == "put_luggage" else action_code
+    action = {
+        "put_luggage": PUT_LUGGAGE_ACTION_TEXT,
+        "idle": IDLE_ACTION_TEXT,
+        "heartbeat": IDLE_ACTION_TEXT,
+    }.get(action_code, action_code)
     return {
         "time": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
         "action": action,
@@ -79,21 +93,47 @@ class MqttPublisher:
 
     def publish_action(self, event: Dict[str, Any], roi_id=None, video_path: str = "") -> bool:
         if not self.config.enabled:
+            print(
+                "[MQTT] skipped disabled topic={} host={}".format(
+                    self.config.topic, self.config.host
+                ),
+                flush=True,
+            )
             return False
         client = self._get_client()
         if client is None:
+            print(
+                "[MQTT] connect failed topic={} host={} error={}".format(
+                    self.config.topic, self.config.host, self._available_error
+                ),
+                flush=True,
+            )
             return False
         payload = build_action_payload(event, roi_id=roi_id, video_path=video_path)
+        payload_json = json.dumps(payload, ensure_ascii=False)
         try:
+            publish_topic = _sanitize_publish_topic(self.config.topic)
             client.publish(
-                self.config.topic,
-                json.dumps(payload, ensure_ascii=False),
+                publish_topic,
+                payload_json,
                 qos=0,
                 retain=False,
+            )
+            print(
+                "[MQTT] topic={} host={} payload={}".format(
+                    publish_topic, self.config.host, payload_json
+                ),
+                flush=True,
             )
             return True
         except Exception as exc:
             self._available_error = str(exc)
+            print(
+                "[MQTT] publish failed topic={} host={} error={} payload={}".format(
+                    self.config.topic, self.config.host, exc, payload_json
+                ),
+                flush=True,
+            )
             return False
 
     def _get_client(self):
@@ -136,3 +176,10 @@ def _safe_port(value: Any) -> int:
     except (TypeError, ValueError):
         return 1883
     return port if 0 < port < 65536 else 1883
+
+
+def _sanitize_publish_topic(topic: str) -> str:
+    clean = str(topic or "").strip()
+    while clean.endswith("/") or clean.endswith("#") or clean.endswith("+"):
+        clean = clean[:-1].rstrip()
+    return clean or DEFAULT_TOPIC

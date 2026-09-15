@@ -1,0 +1,13 @@
+# Validated runtime: Conda environment "mmpose", Python 3.10.20
+numpy==2.2.6
+opencv-contrib-python==5.0.0.93
+PyQt5==5.15.11
+onnxruntime==1.23.2
+paho-mqtt==2.1.0
+
+# PoseC3D path (used only when selected in the application).
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+mmaction2==1.2.0
+mmcv-lite==2.1.0
+mmengine==0.10.7

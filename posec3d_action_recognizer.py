@@ -128,6 +128,18 @@ def _ensure_file(path: Path, url: str) -> Path:
         raise RuntimeError(f"failed to download {url} -> {path}: {exc}") from exc
 
 
+def _resolve_label_map_path(label_map: Optional[str], cache_root: Path) -> Path:
+    if label_map:
+        path = Path(label_map)
+        if not path.is_file():
+            raise FileNotFoundError(str(path))
+        return path
+    local_path = cache_root / DEFAULT_LABEL_MAP_LOCAL.name
+    if local_path.is_file():
+        return local_path
+    return _ensure_file(local_path, DEFAULT_LABEL_MAP_URL)
+
+
 class PoseC3DRecognizer:
     """Online PoseC3D recognizer on top of MediaPipe pose output."""
 
@@ -172,10 +184,7 @@ class PoseC3DRecognizer:
             if (cache_root / DEFAULT_CHECKPOINT_LOCAL.name).is_file()
             else DEFAULT_CHECKPOINT_URL
         )
-        self.label_map_path = _ensure_file(
-            Path(label_map) if label_map else cache_root / DEFAULT_LABEL_MAP_LOCAL.name,
-            DEFAULT_LABEL_MAP_URL,
-        )
+        self.label_map_path = _resolve_label_map_path(label_map, cache_root)
 
         self._labels = self._load_labels(self.label_map_path)
         self._buffer: Deque[Dict[str, np.ndarray]] = deque(maxlen=self.clip_len)

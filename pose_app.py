@@ -162,6 +162,42 @@ def is_stream_source(source):
     lower = str(source or "").lower()
     return lower.startswith("rtsp://") or lower.startswith("rtmp://")
 
+
+def make_file_source_config(source_config, path):
+    return SourceConfig(
+        source_type="file",
+        path_or_url=path,
+        low_latency=bool(source_config.low_latency),
+        infer_stride=int(source_config.infer_stride),
+        display_fps=int(source_config.display_fps),
+        infer_interval_ms=int(source_config.infer_interval_ms),
+    )
+
+
+def reset_thread_action_recognizers(thread):
+    if thread is None:
+        return
+    thread.action_recognizers = {}
+    thread.action_recognizer = None
+    thread._recognizer_generation = getattr(thread, "_recognizer_generation", 0) + 1
+    if hasattr(thread, "_infer_lock"):
+        with thread._infer_lock:
+            thread._last_overlay_poses = []
+            thread._last_action_result = ActionResult("idle", 0.0, "IDLE")
+            thread._last_total_persons = 0
+            thread._last_infer_ms = 0.0
+
+
+def make_posec3d_recognizer_options(display_fps=15, infer_interval_ms=300,
+                                    predict_interval=4):
+    """Build the shared PoseC3D runtime options used by the GUI."""
+    return {
+        "device": default_posec3d_device(),
+        "predict_interval": max(1, int(predict_interval)),
+        "display_fps": max(1, int(display_fps)),
+        "infer_interval_ms": max(50, int(infer_interval_ms)),
+    }
+
 # JSON file that stores the ROI rectangle (x, y, w, h). Loaded on startup.
 ROI_CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -181,7 +217,7 @@ SOURCE_CONFIG_PATH = os.path.join(
 PUT_LUGGAGE_MODEL_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "models",
-    "put_luggage_centroid_model.json"
+    "model202699.json"
 )
 
 # BlazePose 33-keypoint connections (excluding auxiliary points)
@@ -641,7 +677,12 @@ class PoseVideoThread(QThread):
         self._last_action_result = ActionResult("idle", 0.0, "IDLE")
         self._last_total_persons = 0
         self._last_infer_ms = 0.0
+        self._last_mqtt_heartbeat_ms = 0
         self._event_lock = threading.Lock()
+        self._recognizer_generation = 0
+
+    def _is_recognizer_generation_current(self, generation):
+        return generation == self._recognizer_generation
 
     def seek_to(self, frame_idx):
         """Request the thread to jump to a given frame index."""
@@ -757,8 +798,8 @@ class PoseVideoThread(QThread):
                                 pose = self._infer_pose(detect_frame, person)
                                 if pose is not None:
                                     pose = self._offset_pose(pose, roi_rect, frame_h, frame_w)
-                                poses.append(pose)
-                                roi_poses.append(pose)
+                                    poses.append(pose)
+                                    roi_poses.append(pose)
                             poses_by_roi[roi_id] = roi_poses
                     last_poses = list(poses)
                     last_total_persons = total_persons
@@ -794,6 +835,8 @@ class PoseVideoThread(QThread):
                         action_results.append(action_result)
                     last_action_result = self._merge_action_results(action_results)
                 self._draw_action_overlay(display, last_action_result)
+                if last_action_result.state not in ("put_luggage", "stable_operation"):
+                    self._maybe_publish_idle_heartbeat("FULL")
 
                 # Draw every active ROI rectangle with its 1-based number.
                 for roi_num, (rx1, ry1, rx2, ry2) in active_roi_rects:
@@ -888,6 +931,8 @@ class PoseVideoThread(QThread):
                 show_bbox=self.show_bbox,
             )
             self._draw_action_overlay(display, action_result)
+            if action_result.state not in ("put_luggage", "stable_operation"):
+                self._maybe_publish_idle_heartbeat("FULL")
             active_roi_rects = self._active_roi_rects(frame_w, frame_h)
             for roi_num, (rx1, ry1, rx2, ry2) in active_roi_rects:
                 cv.rectangle(display, (rx1, ry1), (rx2 - 1, ry2 - 1),
@@ -922,9 +967,10 @@ class PoseVideoThread(QThread):
             if self._infer_running:
                 return False
             self._infer_running = True
+            generation = self._recognizer_generation
         worker = threading.Thread(
             target=self._async_inference_worker,
-            args=(frame, frame_idx, fps, frame_h, frame_w),
+            args=(frame, frame_idx, fps, frame_h, frame_w, generation),
             daemon=True,
         )
         self._infer_thread = worker
@@ -936,7 +982,8 @@ class PoseVideoThread(QThread):
         if worker is not None and worker.is_alive():
             worker.join(timeout=2.0)
 
-    def _async_inference_worker(self, frame, frame_idx, fps, frame_h, frame_w):
+    def _async_inference_worker(self, frame, frame_idx, fps, frame_h, frame_w,
+                                generation):
         start = time.time()
         try:
             poses, poses_by_roi, total_persons = self._infer_frame(frame, frame_h, frame_w)
@@ -961,10 +1008,11 @@ class PoseVideoThread(QThread):
             merged = self._merge_action_results(action_results)
             infer_ms = (time.time() - start) * 1000.0
             with self._infer_lock:
-                self._last_overlay_poses = list(poses)
-                self._last_action_result = merged
-                self._last_total_persons = total_persons
-                self._last_infer_ms = infer_ms
+                if self._is_recognizer_generation_current(generation):
+                    self._last_overlay_poses = list(poses)
+                    self._last_action_result = merged
+                    self._last_total_persons = total_persons
+                    self._last_infer_ms = infer_ms
         finally:
             with self._infer_lock:
                 self._infer_running = False
@@ -1033,14 +1081,22 @@ class PoseVideoThread(QThread):
             if not os.path.isfile(PUT_LUGGAGE_MODEL_PATH):
                 print("[pose_app] put-luggage clip model missing, fallback to rule:", PUT_LUGGAGE_MODEL_PATH)
                 return PutLuggageRecognizer(fps=fps)
-            return PutLuggageModelRecognizer(
-                model_path=PUT_LUGGAGE_MODEL_PATH,
-                fps=fps,
-                clip_seconds=4.0,
-                sample_stride_frames=10,
-                threshold=0.5,
-                cooldown_seconds=2.0,
-            )
+            try:
+                return PutLuggageModelRecognizer(
+                    model_path=PUT_LUGGAGE_MODEL_PATH,
+                    fps=fps,
+                    clip_seconds=4.0,
+                    sample_stride_frames=10,
+                    threshold=0.5,
+                    cooldown_seconds=2.0,
+                )
+            except Exception as exc:
+                print(
+                    "[pose_app] put-luggage clip model invalid, fallback to rule:",
+                    PUT_LUGGAGE_MODEL_PATH,
+                    exc,
+                )
+                return PutLuggageRecognizer(fps=fps)
         if self.recognizer_kind == "posec3d":
             if PoseC3DRecognizer is None:
                 raise RuntimeError(
@@ -1089,6 +1145,23 @@ class PoseVideoThread(QThread):
                 roi_id = payload.get("roi_id")
                 self.mqtt_publisher.publish_action(
                     payload, roi_id=roi_id, video_path=self.video_path)
+
+    def _maybe_publish_idle_heartbeat(self, roi_id="FULL"):
+        if self.mqtt_publisher is None:
+            return
+        now_ms = int(time.time() * 1000)
+        if now_ms - self._last_mqtt_heartbeat_ms < 5000:
+            return
+        event = {
+            "event": "idle",
+            "state": "idle",
+            "confidence": 0.0,
+            "frame_idx": None,
+            "timestamp_ms": None,
+            "roi_id": roi_id,
+        }
+        if self.mqtt_publisher.publish_action(event, roi_id=roi_id, video_path=self.video_path):
+            self._last_mqtt_heartbeat_ms = now_ms
 
     @staticmethod
     def _draw_action_overlay(display, action_result):
@@ -1231,6 +1304,7 @@ class PoseMainWindow(QMainWindow):
         self._build_ui()
         self._init_models()
         self._load_rois()
+        self._send_startup_heartbeat()
 
     def _build_ui(self):
         central = QWidget()
@@ -1458,7 +1532,7 @@ class PoseMainWindow(QMainWindow):
                 self, "Open Video", self.source_config.path_or_url or "",
                 "Video Files (*.mp4 *.avi *.mov *.mkv *.flv *.webm);;All Files (*)")
             if path:
-                self.source_config = SourceConfig("file", path)
+                self.source_config = make_file_source_config(self.source_config, path)
                 try:
                     save_source_config(self.source_config, SOURCE_CONFIG_PATH)
                 except Exception as e:
@@ -1510,12 +1584,10 @@ class PoseMainWindow(QMainWindow):
             show_bbox=self.chk_bbox.isChecked(),
             rois=self.rois,
             recognizer_kind=self.recognizer_kind,
-            recognizer_options={
-                "device": default_posec3d_device(),
-                "predict_interval": 12,
-                "display_fps": self.source_config.display_fps,
-                "infer_interval_ms": self.source_config.infer_interval_ms,
-            },
+            recognizer_options=make_posec3d_recognizer_options(
+                display_fps=self.source_config.display_fps,
+                infer_interval_ms=self.source_config.infer_interval_ms,
+            ),
             mqtt_publisher=MqttPublisher(self.mqtt_config) if self.mqtt_config.enabled else None,
             low_latency=self.source_config.low_latency,
             infer_stride=self.source_config.infer_stride,
@@ -1600,6 +1672,26 @@ class PoseMainWindow(QMainWindow):
             config.host, config.port, config.topic) if config.enabled else "MQTT 已禁用"
         self.status.showMessage(status)
         QMessageBox.information(self, "MQTT配置", "配置已保存，下次启动将自动读取。")
+
+    def _send_startup_heartbeat(self):
+        if not self.mqtt_config.enabled:
+            return
+        publisher = MqttPublisher(self.mqtt_config)
+        try:
+            ok = publisher.publish_action(
+                {
+                    "event": "heartbeat",
+                    "state": "idle",
+                    "confidence": 0.0,
+                    "frame_idx": None,
+                    "timestamp_ms": None,
+                },
+                roi_id="FULL",
+                video_path="startup",
+            )
+            print("[pose_app] startup mqtt heartbeat ok={}".format(ok), flush=True)
+        finally:
+            publisher.close()
 
     def _configure_source(self):
         dlg = SourceConfigDialog(self.source_config, parent=self)
@@ -1696,6 +1788,7 @@ class PoseMainWindow(QMainWindow):
         self.roi_frame_size = None
         if self.thread is not None:
             self.thread.rois = []
+            reset_thread_action_recognizers(self.thread)
         self.status.showMessage("ROI 已全部清除")
 
     def _validate_rois_for_video(self, frame_w, frame_h):
@@ -1707,6 +1800,9 @@ class PoseMainWindow(QMainWindow):
             return
         self.rois = []
         self.roi_frame_size = None
+        if self.thread is not None:
+            self.thread.rois = []
+            reset_thread_action_recognizers(self.thread)
         print(
             "[pose_app] cleared saved ROI because video size differs or "
             "roi_config has no frame_size. current_size=({}, {})".format(
@@ -1752,6 +1848,7 @@ class PoseMainWindow(QMainWindow):
             self.roi_frame_size = self.video_frame_size
             if self.thread is not None:
                 self.thread.rois = list(self.rois)
+                reset_thread_action_recognizers(self.thread)
             if not self.rois:
                 self.status.showMessage("ROI 已全部清除")
             else:

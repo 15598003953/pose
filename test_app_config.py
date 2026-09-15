@@ -7,6 +7,7 @@ from app_config import (
     load_source_config,
     save_source_config,
 )
+from pose_app import make_file_source_config
 
 
 class SourceConfigTest(unittest.TestCase):
@@ -59,6 +60,25 @@ class SourceConfigTest(unittest.TestCase):
             save_source_config(expected, path)
             actual = load_source_config(path)
 
+        self.assertFalse(actual.low_latency)
+        self.assertEqual(5, actual.infer_stride)
+        self.assertEqual(20, actual.display_fps)
+        self.assertEqual(500, actual.infer_interval_ms)
+
+    def test_make_file_source_config_preserves_runtime_settings(self):
+        source_config = SourceConfig(
+            source_type="rtsp",
+            path_or_url="rtsp://127.0.0.1/live",
+            low_latency=False,
+            infer_stride=5,
+            display_fps=20,
+            infer_interval_ms=500,
+        )
+
+        actual = make_file_source_config(source_config, "D:/video.mp4")
+
+        self.assertEqual("file", actual.source_type)
+        self.assertEqual("D:/video.mp4", actual.path_or_url)
         self.assertFalse(actual.low_latency)
         self.assertEqual(5, actual.infer_stride)
         self.assertEqual(20, actual.display_fps)
