@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pose-project"
+version = "0.1.0"
+description = "Video pose analysis and passenger-to-tray binding workbench"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+dynamic = ["dependencies"]
+
+[project.scripts]
+pose = "pose_project.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}

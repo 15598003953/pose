@@ -1,0 +1,77 @@
+{
+  "transport": "local",
+  "gate": {
+    "source": "",
+    "roi": {
+      "x": 0.22131147540983606,
+      "y": 0.0,
+      "w": 0.5986885245901639,
+      "h": 1.0
+    },
+    "opts": {
+      "rotate": 180,
+      "det_interval": 1,
+      "min_h": 15,
+      "merge_thr": 0.5,
+      "merge_time_window": 2,
+      "use_yolo": true,
+      "yolo_input": 640,
+      "yolo_conf": 0.2,
+      "require_face": true,
+      "require_approach": true,
+      "face_growth": 0.02,
+      "min_face_w": 80,
+      "approach_min_frames": 3,
+      "gate_line_bottom_pct": 8,
+      "min_sharp": 30,
+      "min_hits": 2,
+      "prefer_static": true,
+      "hog_confirm": false,
+      "face_scan": false,
+      "time_override": ""
+    }
+  },
+  "reid": {
+    "source": "",
+    "rotate180": false,
+    "threshold": 0.65,
+    "image_size": [1920, 1080],
+    "enabled_regions": ["A"],
+    "detector_weights": "D:/code/mediapipe-master/pose/reid1026001/yolov8s.pt",
+    "reid_weights": "D:/code/mediapipe-master/pose/reid1026001/weights/msmt_sbs_R50.pth"
+  },
+  "binding": {
+    "topics": {
+      "detections": "reidtest",
+      "rfid": "pose/rfid"
+    },
+    "binding_parameters": {
+      "lookback_ms": 10000,
+      "min_dwell_ms": 5000,
+      "binding_wait_ms": 600,
+      "max_sample_gap_ms": 600,
+      "max_position_age_ms": 600,
+      "rfid_time_offset_ms": 0
+    },
+    "regions": {
+      "A": {
+        "roi_xyxy": [0, 0, 960, 1080],
+        "operation_roi_xyxy": [300, 250, 500, 500]
+      },
+      "B": {
+        "roi_xyxy": [960, 0, 1920, 1080],
+        "operation_roi_xyxy": [1260, 250, 1460, 500]
+      }
+    }
+  },
+  "mqtt": {
+    "host": "127.0.0.1",
+    "port": 1883,
+    "username": "",
+    "tls": false,
+    "person_topic": "check_gate/person/collected",
+    "output_topic": "pose/bindings",
+    "output_enabled": false
+  },
+  "output_dir": "D:/code/mediapipe-master/pose/result/integration"
+}

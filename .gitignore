@@ -19,3 +19,6 @@ result/
 *.onnx
 mqtt_config.json
 source_config.json
+*.egg-info/
+dist/
+.pytest_cache/

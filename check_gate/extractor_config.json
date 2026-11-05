@@ -1,0 +1,30 @@
+{
+  "roi": {
+    "x": 0.22,
+    "y": 0.1,
+    "w": 0.6,
+    "h": 0.8
+  },
+  "opts": {
+    "rotate": 180,
+    "det_interval": 1,
+    "min_h": 15,
+    "merge_thr": 0.5,
+    "merge_time_window": 2,
+    "use_yolo": true,
+    "yolo_input": 640,
+    "yolo_conf": 0.2,
+    "require_face": true,
+    "require_approach": true,
+    "face_growth": 0.02,
+    "min_face_w": 80,
+    "approach_min_frames": 3,
+    "gate_line_bottom_pct": 8,
+    "min_sharp": 30,
+    "min_hits": 2,
+    "prefer_static": true,
+    "hog_confirm": false,
+    "face_scan": false,
+    "time_override": ""
+  }
+}

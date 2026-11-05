@@ -1,0 +1,24 @@
+{
+  "topics": {
+    "detections": "simulation/binding/detections",
+    "rfid": "simulation/binding/rfid"
+  },
+  "binding_parameters": {
+    "lookback_ms": 10000,
+    "min_dwell_ms": 5000,
+    "binding_wait_ms": 600,
+    "max_sample_gap_ms": 600,
+    "max_position_age_ms": 600,
+    "rfid_time_offset_ms": 0
+  },
+  "regions": {
+    "A": {
+      "roi_xyxy": [0, 0, 960, 1080],
+      "operation_roi_xyxy": [300, 250, 500, 500]
+    },
+    "B": {
+      "roi_xyxy": [960, 0, 1920, 1080],
+      "operation_roi_xyxy": [1260, 250, 1460, 500]
+    }
+  }
+}

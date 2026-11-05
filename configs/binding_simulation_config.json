@@ -1,0 +1,133 @@
+{
+  "seed": 20261020,
+  "start_time": "2026-10-20T09:00:00+08:00",
+  "duration_ms": 360000,
+  "update_interval_ms": 200,
+  "frame_size": [1920, 1080],
+  "bbox_jitter_px": 6,
+  "detection_delay_ms": [20, 450],
+  "photoelectric_delay_ms": [5, 40],
+  "topics": {
+    "detections": "simulation/binding/detections",
+    "rfid": "simulation/binding/rfid"
+  },
+  "binding_parameters": {
+    "lookback_ms": 10000,
+    "min_dwell_ms": 5000
+  },
+  "regions": {
+    "A": {
+      "roi_xyxy": [0, 0, 960, 1080],
+      "operation_roi_xyxy": [300, 250, 500, 500]
+    },
+    "B": {
+      "roi_xyxy": [960, 0, 1920, 1080],
+      "operation_roi_xyxy": [1260, 250, 1460, 500]
+    }
+  },
+  "tracks": [
+    {
+      "name": "a_operator_1",
+      "roi_id": "A",
+      "bbox_size": [160, 240],
+      "segments": [
+        {"start_ms": 0, "end_ms": 97000, "center": [400, 375]},
+        {"start_ms": 97000, "end_ms": 100000, "center": [650, 375]},
+        {"start_ms": 100000, "end_ms": 132000, "center": [400, 375]},
+        {"start_ms": 132000, "end_ms": 360000, "center": [650, 375]}
+      ]
+    },
+    {
+      "name": "a_operator_2",
+      "roi_id": "A",
+      "bbox_size": [160, 240],
+      "segments": [
+        {"start_ms": 125000, "end_ms": 132000, "center": [730, 375]},
+        {"start_ms": 132000, "end_ms": 360000, "center": [400, 375]}
+      ]
+    },
+    {
+      "name": "a_companion",
+      "roi_id": "A",
+      "bbox_size": [160, 240],
+      "segments": [
+        {"start_ms": 0, "end_ms": 360000, "center": [780, 650]}
+      ]
+    },
+    {
+      "name": "a_passerby",
+      "roi_id": "A",
+      "bbox_size": [160, 240],
+      "segments": [
+        {
+          "start_ms": 59000,
+          "end_ms": 61000,
+          "center": [100, 375],
+          "end_center": [850, 375]
+        },
+        {
+          "start_ms": 191000,
+          "end_ms": 193000,
+          "center": [100, 375],
+          "end_center": [850, 375]
+        }
+      ]
+    },
+    {
+      "name": "b_operator_1",
+      "roi_id": "B",
+      "bbox_size": [160, 240],
+      "segments": [
+        {"start_ms": 0, "end_ms": 280000, "center": [1360, 375]},
+        {"start_ms": 280000, "end_ms": 283000, "center": [1660, 375]},
+        {"start_ms": 283000, "end_ms": 360000, "center": [1360, 375]}
+      ]
+    },
+    {
+      "name": "b_companion",
+      "roi_id": "B",
+      "bbox_size": [160, 240],
+      "segments": [
+        {"start_ms": 0, "end_ms": 360000, "center": [1730, 650]}
+      ]
+    }
+  ],
+  "push_events": [
+    {
+      "at_ms": 60000, "roi_id": "A", "rfid": "RFID-A-0001",
+      "passenger": "a_operator_1", "scenario": "first_tray_with_passerby"
+    },
+    {
+      "at_ms": 90000, "roi_id": "A", "rfid": "RFID-A-0002",
+      "passenger": "a_operator_1", "scenario": "same_person_multiple_trays"
+    },
+    {
+      "at_ms": 101000, "roi_id": "A", "rfid": "RFID-A-0003",
+      "passenger": "a_operator_1", "scenario": "return_after_three_second_absence"
+    },
+    {
+      "at_ms": 120000, "roi_id": "A", "rfid": "RFID-A-0004",
+      "passenger": "a_operator_1", "scenario": "same_person_multiple_trays"
+    },
+    {
+      "at_ms": 192000, "roi_id": "A", "rfid": "RFID-A-0005",
+      "passenger": "a_operator_2", "scenario": "handover_old_person_still_in_roi"
+    },
+    {
+      "at_ms": 240000, "roi_id": "A", "rfid": "RFID-A-0006",
+      "passenger": "a_operator_2", "scenario": "same_person_multiple_trays"
+    },
+    {
+      "at_ms": 300000, "roi_id": "A", "rfid": "RFID-A-0007",
+      "passenger": "a_operator_2", "scenario": "simultaneous_regions"
+    },
+    {
+      "at_ms": 300000, "roi_id": "B", "rfid": "RFID-B-0001",
+      "passenger": "b_operator_1", "scenario": "five_minute_first_tray"
+    },
+    {
+      "at_ms": 330000, "roi_id": "B", "rfid": "RFID-B-0002",
+      "passenger": "b_operator_1", "scenario": "same_person_multiple_trays"
+    }
+  ]
+}
