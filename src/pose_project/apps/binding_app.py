@@ -1,4 +1,4 @@
-"""Qt workbench for passenger/tray binding."""
+"""独立绑定工作台：消息输入、区域显示、算法参数和判定结果。"""
 
 import argparse
 from datetime import datetime

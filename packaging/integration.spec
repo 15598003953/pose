@@ -1,18 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import os
 from PyInstaller.utils.hooks import copy_metadata
 
 root = Path(SPECPATH).parent
+app_name = os.environ.get("POSE_EXE_NAME", "PoseIntegration")
 datas = [
-    (str(root / "check_gate/person_extractor.py"), "check_gate"),
-    (str(root / "check_gate/mqtt_publisher.py"), "check_gate"),
-    (str(root / "check_gate/extractor_config.json"), "check_gate"),
-    (str(root / "check_gate/models"), "check_gate/models"),
-    (str(root / "reid1026001/main.py"), "reid1026001"),
-    (str(root / "reid1026001/reid_core.py"), "reid1026001"),
-    (str(root / "reid1026001/yolov8s.pt"), "reid1026001"),
-    (str(root / "reid1026001/weights/msmt_sbs_R50.pth"), "reid1026001/weights"),
+    # Python 源码由模块依赖收集，数据区只放模型和默认配置。
+    (str(root / "configs/gate_config.json"), "configs"),
+    (str(root / "models/gate"), "models/gate"),
+    (str(root / "models/reid"), "models/reid"),
 ]
 for name in ("torch", "torchvision", "ultralytics", "ultralytics-thop",
              "lapx", "numpy", "opencv-contrib-python", "PyQt5", "paho-mqtt",
@@ -24,6 +22,7 @@ a = Analysis(
     pathex=[str(root / "src")],
     binaries=[], datas=datas,
     hiddenimports=[
+        "pose_project.gate.processor", "pose_project.reid.search_worker",
         "torch", "torchvision", "torchvision.transforms", "torchvision.ops",
         "ultralytics", "ultralytics.nn.tasks", "ultralytics.trackers.byte_tracker",
         "ultralytics.trackers.bot_sort", "lap", "thop", "cpuinfo", "psutil",
@@ -40,7 +39,7 @@ a = Analysis(
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, [],
-    exclude_binaries=True, name="PoseIntegration", console=True,
+    exclude_binaries=True, name=app_name, console=True,
     debug=False, strip=False, upx=False, contents_directory="_internal",
 )
-coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name="PoseIntegration")
+coll = COLLECT(exe, a.binaries, a.datas, strip=False, upx=False, name=app_name)

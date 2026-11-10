@@ -1,6 +1,5 @@
-"""Resource paths for the editable local project, independent of the working directory."""
+"""统一资源路径：区分源码、发布资源与可写配置，不依赖命令启动目录。"""
 
-import os
 from pathlib import Path
 import sys
 
@@ -10,10 +9,9 @@ ROOT = (Path(sys._MEIPASS) if getattr(sys, "frozen", False)
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
 CONFIG_DIR = APP_DIR / "configs"
 MODEL_DIR = ROOT / "models"
+GATE_MODEL_DIR = MODEL_DIR / "gate"
+REID_MODEL_DIR = MODEL_DIR / "reid"
+# 发布包的默认配置随资源打包；用户修改的配置写到 EXE 旁的 configs。
+RESOURCE_CONFIG_DIR = ROOT / "configs"
 DATA_DIR = ROOT / "data"
 RESULT_DIR = APP_DIR / "result"
-POSE_MODEL_PATH = str(MODEL_DIR / "pose_estimation_mediapipe_2023mar.onnx")
-PERSON_MODEL_PATH = os.environ.get("PERSON_DET_MODEL") or str(
-    MODEL_DIR / "person_detection_mediapipe_2023mar.onnx"
-)
-PUT_LUGGAGE_MODEL_PATH = str(MODEL_DIR / "put_luggage_centroid_model.json")

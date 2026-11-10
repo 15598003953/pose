@@ -1,4 +1,4 @@
-"""Generate replay datasets from the existing scenario templates."""
+"""模拟数据生成对话框：编辑场景模板并在后台生成可回放消息。"""
 
 from copy import deepcopy
 from datetime import datetime
@@ -27,7 +27,7 @@ class SimulationWorker(QThread):
             messages, expected = generate_dataset(self.config)
             self.result = write_dataset(self.output, self.config, messages, expected)
         except Exception as exc:
-            # Keep background failures visible instead of leaving the dialog busy.
+            # 后台异常必须返回界面，避免一直显示正在生成。
             self.error = str(exc) or type(exc).__name__
 
 

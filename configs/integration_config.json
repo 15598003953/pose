@@ -1,12 +1,12 @@
 {
   "transport": "local",
   "gate": {
-    "source": "",
+    "source": "D:/code/mediapipe-master/pose/data/BC5496691_1_20260923T180406Z_20260923T182102Z.mp4",
     "roi": {
-      "x": 0.22131147540983606,
-      "y": 0.0,
-      "w": 0.5986885245901639,
-      "h": 1.0
+      "x": 0.4640625,
+      "y": 0.21296296296296297,
+      "w": 0.22864583333333333,
+      "h": 0.7101851851851851
     },
     "opts": {
       "rotate": 180,
@@ -22,7 +22,7 @@
       "face_growth": 0.02,
       "min_face_w": 80,
       "approach_min_frames": 3,
-      "gate_line_bottom_pct": 8,
+      "gate_line_bottom_pct": 8.0,
       "min_sharp": 30,
       "min_hits": 2,
       "prefer_static": true,
@@ -32,13 +32,23 @@
     }
   },
   "reid": {
-    "source": "",
-    "rotate180": false,
-    "threshold": 0.65,
-    "image_size": [1920, 1080],
-    "enabled_regions": ["A"],
-    "detector_weights": "D:/code/mediapipe-master/pose/reid1026001/yolov8s.pt",
-    "reid_weights": "D:/code/mediapipe-master/pose/reid1026001/weights/msmt_sbs_R50.pth"
+    "source": "D:/code/mediapipe-master/pose/data/output_20260923002.ts",
+    "rotate180": true,
+    "threshold": 0.55,
+    "image_size": [
+      1920,
+      1080
+    ],
+    "enabled_regions": [
+      "A",
+      "B"
+    ],
+    "detector_weights": "../models/reid/yolov8s.pt",
+    "reid_weights": "../models/reid/msmt_sbs_R50.pth",
+    "sample_interval_ms": 200,
+    "detector_image_size": 960,
+    "preview_fps": 15,
+    "flip_tta": true
   },
   "binding": {
     "topics": {
@@ -50,17 +60,27 @@
       "min_dwell_ms": 5000,
       "binding_wait_ms": 600,
       "max_sample_gap_ms": 600,
-      "max_position_age_ms": 600,
+      "max_position_age_ms": 900,
       "rfid_time_offset_ms": 0
     },
     "regions": {
       "A": {
-        "roi_xyxy": [0, 0, 960, 1080],
-        "operation_roi_xyxy": [300, 250, 500, 500]
+        "front_mode": "bottom",
+        "roi_xyxy": [
+          870,
+          380,
+          1098,
+          911
+        ]
       },
       "B": {
-        "roi_xyxy": [960, 0, 1920, 1080],
-        "operation_roi_xyxy": [1260, 250, 1460, 500]
+        "front_mode": "bottom",
+        "roi_xyxy": [
+          325,
+          378,
+          623,
+          1048
+        ]
       }
     }
   },
@@ -73,5 +93,8 @@
     "output_topic": "pose/bindings",
     "output_enabled": false
   },
-  "output_dir": "D:/code/mediapipe-master/pose/result/integration"
+  "output_dir": "D:/code/mediapipe-master/pose/result/integration",
+  "debug": {
+    "enabled": false
+  }
 }

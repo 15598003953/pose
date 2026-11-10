@@ -1,4 +1,4 @@
-"""Replay reception-ordered messages and optionally compare independent labels."""
+"""按接收顺序回放消息；有独立标签时评估绑定结果，并保存判定依据。"""
 
 import argparse
 import json

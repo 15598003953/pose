@@ -1,4 +1,4 @@
-"""Keep library caches writable and avoid online dependency installation."""
+"""发布包启动设置：把库缓存放到可写目录，并关闭在线依赖自动安装。"""
 
 import os
 from pathlib import Path

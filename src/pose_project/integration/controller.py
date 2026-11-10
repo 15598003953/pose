@@ -1,4 +1,4 @@
-"""One event path for local and MQTT integration sessions."""
+"""联合会话控制：连接抓拍、重识别、绑定和界面，并统一保存运行记录。"""
 
 from collections import Counter, deque
 from copy import deepcopy
@@ -8,16 +8,19 @@ import logging
 from pathlib import Path
 import re
 import sys
+import threading
 import time
 import uuid
 
-from PyQt5.QtCore import QObject, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 
 from pose_project.binding.binding_runtime import (
     DEFAULT_FIELDS, LiveInbox, MqttLink, normalize_message,
 )
 from pose_project.binding.passenger_tray_binding import PassengerTrayBinder
-from pose_project.integration.configuration import new_run_directory, validate, save_settings
+from pose_project.integration.configuration import (
+    active_binding, is_stream_source, new_run_directory, validate, save_settings,
+)
 from pose_project.integration.workers import GateWorker, RecognitionWorker, encode_image
 
 
@@ -35,6 +38,7 @@ def message_preview(payload):
 
 class IntegrationController(QObject):
     frame = pyqtSignal(str, object)
+    recognition = pyqtSignal(dict)
     person = pyqtSignal(dict)
     message = pyqtSignal(dict)
     decision = pyqtSignal(dict)
@@ -62,6 +66,70 @@ class IntegrationController(QObject):
         self.run_dir = None
         self.settings = None
         self._handles = {}
+        self._display_lock = threading.Lock()
+        self._preview_frames = {}
+        self._latest_result = None
+        self._preview_sequences = {}
+        self._next_preview = 0.0
+        self._next_debug = 0.0
+        self._position_ages = {}
+        self.debug_enabled = False
+
+    def _store_frame(self, stage, image):
+        # 每路只保留最新画面，后台推理较慢时也不积压界面事件。
+        with self._display_lock:
+            self._preview_frames[stage] = image
+
+    def _store_result(self, report):
+        with self._display_lock:
+            self._latest_result = report
+
+    def _flush_previews(self):
+        with self._display_lock:
+            frames, self._preview_frames = self._preview_frames, {}
+        worker = self.workers.get("reid")
+        if worker is not None and worker.isRunning():
+            image, sequence, _ = worker.latest_preview(self._preview_sequences.get("reid", -1))
+            if image is not None:
+                frames["reid"] = image
+                self._preview_sequences["reid"] = sequence
+            elif is_stream_source(self.settings["reid"]["source"]):
+                frames.pop("reid", None)
+        for stage, image in frames.items():
+            self.frame.emit(stage, image)
+
+    def set_debug(self, enabled):
+        self.debug_enabled = bool(enabled)
+        if self.running and enabled and "performance" not in self._handles:
+            self._handles["performance"] = (
+                self.run_dir / "performance.jsonl").open("a", encoding="utf-8")
+
+    def _flush_result(self):
+        with self._display_lock:
+            report, self._latest_result = self._latest_result, None
+        if report is None:
+            return
+        metrics = report["metrics"]
+        metrics["ui_delivery_ms"] = max(0, self.inbox.now() - report["completed_at_ms"])
+        metrics["mqtt_pending"] = len(self.pending_sends)
+        with self.inbox.lock:
+            metrics["message_pending"] = len(self.inbox.items)
+        metrics["position_age_ms"] = dict(self._position_ages)
+        self.recognition.emit(report)
+        now = time.monotonic()
+        if self.debug_enabled and now >= self._next_debug:
+            self._next_debug = now + 1
+            performance_report = {
+                key: value for key, value in report.items() if key != "_frame"}
+            self._handles["performance"].write(
+                json.dumps(performance_report, ensure_ascii=False) + "\n")
+            self._handles["performance"].flush()
+            self.write_log("[性能] 设备={} 处理={:.0f}ms 检测={:.0f}ms 特征={:.0f}ms "
+                           "界面等待={}ms 跳帧={} 入库等待={}".format(
+                               metrics["device"], metrics["processing_ms"],
+                               metrics["detection_ms"], metrics["reid_ms"],
+                               metrics["ui_delivery_ms"], metrics["skipped"],
+                               metrics["gallery_pending"]))
 
     def write_log(self, text):
         text = re.sub(r"(rtsps?://)[^/@\s]+:[^/@\s]+@", r"\1***@", str(text))
@@ -70,10 +138,12 @@ class IntegrationController(QObject):
         self.log.emit(line)
 
     def start(self, settings, start_workers=True):
+        # 每次启动新建会话目录和算法状态，避免沿用上次的旅客与轨迹。
         if self.running or self.stopping:
             raise ValueError("上一轮调试仍在运行或停止中")
         validate(settings, sources=start_workers)
         self.settings = deepcopy(settings)
+        self.settings["binding"] = active_binding(settings)
         self.run_dir = new_run_directory(settings)
         save_settings(settings, self.run_dir / "settings.json")
         handler = logging.FileHandler(self.run_dir / "runtime.log", encoding="utf-8")
@@ -83,7 +153,7 @@ class IntegrationController(QObject):
             key: (self.run_dir / (key + ".jsonl")).open("a", encoding="utf-8")
             for key in ("messages", "decisions")
         }
-        self.binder = PassengerTrayBinder(settings["binding"])
+        self.binder = PassengerTrayBinder(self.settings["binding"])
         self.inbox = LiveInbox()
         self.seen_events = {}
         self.records.clear()
@@ -91,8 +161,14 @@ class IntegrationController(QObject):
         self.pending_sends.clear()
         self.output_index = 0
         self.workers.clear()
+        self._preview_frames.clear()
+        self._preview_sequences.clear()
+        self._latest_result = None
+        self._position_ages.clear()
+        self._next_preview = self._next_debug = 0.0
         self.running = True
         self.stopping = False
+        self.set_debug(settings.get("debug", {}).get("enabled", False))
         self.running_changed.emit(True)
         try:
             if settings["transport"] == "mqtt":
@@ -116,15 +192,20 @@ class IntegrationController(QObject):
                 gate = GateWorker(deepcopy(settings["gate"]), self.run_dir / "gate",
                                   clock=self.inbox.now)
                 reid = RecognitionWorker(deepcopy(settings["reid"]),
-                                         deepcopy(settings["binding"]["regions"]),
+                                         deepcopy(self.settings["binding"]["regions"]),
                                          clock=self.inbox.now)
                 self.workers = {"gate": gate, "reid": reid}
-                gate.frame.connect(lambda image: self.frame.emit("gate", image))
+                # 界面忙碌时仍限制待显示画面数量，避免预览持续显示旧画面。
+                gate.frame.connect(lambda image: self._store_frame("gate", image),
+                                   type=Qt.DirectConnection)
                 gate.person.connect(self.receive_collected)
-                reid.frame.connect(lambda image: self.frame.emit("reid", image))
+                reid.frame.connect(lambda image: self._store_frame("reid", image),
+                                   type=Qt.DirectConnection)
+                reid.result.connect(self._store_result, type=Qt.DirectConnection)
                 reid.snapshot.connect(self.receive_snapshot)
                 reid.person_added.connect(self.person)
-                reid.ready.connect(lambda: self.state.emit("reid", "识别中"))
+                reid.ready.connect(
+                    lambda worker=reid: self.state.emit("reid", worker.runtime_status))
                 for name, worker in self.workers.items():
                     worker.log.connect(lambda text, stage=name: self.write_log(
                         "[{}] {}".format(stage, text)))
@@ -237,6 +318,7 @@ class IntegrationController(QObject):
             self.seen_events[(payload["roi_id"], payload["event_id"])] = payload["rfid"]
         if topic == self.settings["binding"]["topics"]["detections"]:
             age = received - payload["captured_at_ms"]
+            self._position_ages[payload["roi_id"]] = age
             self.state.emit("binding", "接收中 / 位置延迟 {} ms".format(age))
 
     def _record_decisions(self, decisions):
@@ -286,6 +368,11 @@ class IntegrationController(QObject):
                 self.write_log("消息无效：" + str(exc))
         if watermark is not None and watermark >= self.binder.last_received_at_ms:
             self._record_decisions(self.binder.advance(watermark))
+        self._flush_result()
+        now = time.monotonic()
+        if now >= self._next_preview:
+            self._next_preview = now + 1 / self.settings["reid"].get("preview_fps", 15)
+            self._flush_previews()
         if self.stopping and not any(w.isRunning() for w in self.workers.values()):
             self._finish_stop()
 

@@ -1,25 +1,23 @@
-"""Load local models and exercise their actual inference dependencies."""
+"""本地模型诊断：实际加载并推理，检查检测器、重识别特征形状和数值。"""
 
 import importlib.metadata
 
 import numpy as np
-
-from pose_project.integration.workers import legacy_module
-
 
 def check_models(settings):
     report = {"ok": False, "kind": "local-model-inference-only"}
     try:
         import torch
 
-        gate = legacy_module("check_gate", "person_extractor.py")
+        from pose_project.gate import core as gate
+        from pose_project.reid import core as module
+
         detector = gate.PersonDetector(settings["gate"]["opts"])
         if detector.yolo is None or not detector.face_engine.available:
             raise RuntimeError("闸机人体或人脸模型没有成功加载")
         detector.detect(np.zeros((640, 640, 3), dtype=np.uint8))
         report["gate"] = {"person": detector.yolo.available,
                           "face": detector.face_engine.status_text()}
-        module = legacy_module("reid1026001", "main.py")
         person = module.PersonDetector(weights=settings["reid"]["detector_weights"],
                                        allow_download=False)
         boxes, _, _ = person.detect_track(np.zeros((640, 640, 3), dtype=np.uint8),

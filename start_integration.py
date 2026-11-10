@@ -1,4 +1,4 @@
-"""Start the integration workbench without relying on an editable install."""
+"""联合工作台启动入口；自动加入 src 路径，源码运行时无需可编辑安装。"""
 
 from pathlib import Path
 import multiprocessing

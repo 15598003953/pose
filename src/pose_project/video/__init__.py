@@ -1,1 +1,1 @@
-"""Video sources and frame capture."""
+"""视频来源配置、本地文件读取和网络流取帧。"""

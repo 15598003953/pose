@@ -1,4 +1,4 @@
-"""Bind RFID reception events to passenger position history, without labels."""
+"""用旅客位置历史匹配行李框 RFID；只使用检测与收报时间，不读取评估标签。"""
 
 from collections import defaultdict, deque
 from copy import deepcopy
@@ -38,7 +38,7 @@ def require_box(value, name):
     return value
 
 
-def validate_config(config):
+def validate_config(config, *, allow_empty_regions=False):
     parameters = config["binding_parameters"]
     for key in ("lookback_ms", "min_dwell_ms", "max_sample_gap_ms", "max_position_age_ms"):
         require_int(parameters[key], key, 1)
@@ -51,7 +51,9 @@ def validate_config(config):
         require_text(topics[key], "topics.{}".format(key))
     if topics["detections"] == topics["rfid"]:
         raise ValueError("detection and RFID topics must differ")
-    if not isinstance(config["regions"], dict) or not config["regions"]:
+    if not isinstance(config["regions"], dict) or (
+        not config["regions"] and not allow_empty_regions
+    ):
         raise ValueError("regions must be a nonempty object")
     for roi_id, region in config["regions"].items():
         if not re.fullmatch("[A-Z]", roi_id):
@@ -66,7 +68,7 @@ def validate_config(config):
 
 
 class PassengerTrayBinder:
-    """Consume full ROI snapshots in reception order; advance() acts as a timer."""
+    """按接收时间处理整区快照；advance 用于到期判定，finish 用于结束回放。"""
 
     def __init__(self, config):
         validate_config(config)
@@ -113,7 +115,7 @@ class PassengerTrayBinder:
         else:
             raise ValueError("unknown topic: {}".format(topic))
 
-        # All messages arriving exactly at a deadline are available to that decision.
+        # 截止时刻收到的消息也参与本次判定，先处理严格早于当前时刻的任务。
         decisions = self._finalize(received, inclusive=False)
         self.last_received_at_ms = received
         if topic == self.config["topics"]["detections"]:
@@ -162,6 +164,7 @@ class PassengerTrayBinder:
                     del history[captured]
 
     def _decide(self, event):
+        # RFID 参考时刻之前的最后位置决定人员是否仍在区内，过期位置不可使用。
         reference = event["reference_at_ms"]
         samples = sorted(
             (captured, people)
@@ -182,7 +185,7 @@ class PassengerTrayBinder:
         for (begin, before), (end, after) in zip(samples, samples[1:]):
             duration = end - max(begin, window_start)
             if duration > 0 and end - begin <= self.parameters["max_sample_gap_ms"]:
-                # Count only intervals supported by presence at both endpoints.
+                # 相邻两次检测都看到同一旅客，才累计中间的停留时间。
                 for passenger_id in before & after:
                     dwell[passenger_id] += duration
         eligible = []
@@ -204,6 +207,7 @@ class PassengerTrayBinder:
         elif not eligible:
             result["reason"] = "no_eligible_candidate"
         elif len(eligible) == 1:
+            # 只有一个合格旅客才绑定；多人同时满足条件时保留为待确认。
             result.update(status="bound", reason="unique_candidate", passenger_id=eligible[0])
             result["binding"] = {
                 "roi_id": event["roi_id"],

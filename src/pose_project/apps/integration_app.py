@@ -1,4 +1,4 @@
-"""Integrated passenger capture, re-identification and tray-binding workbench."""
+"""联合工作台界面：编辑配置，展示两路画面、旅客证据、识别和绑定结果。"""
 
 import argparse
 from copy import deepcopy
@@ -6,11 +6,13 @@ from datetime import datetime
 import json
 from pathlib import Path
 import signal
+import string
 import sys
+import time
 import uuid
 
 from PyQt5.QtCore import QCoreApplication, QSize, Qt, QTimer
-from PyQt5.QtGui import QFont, QFontDatabase, QIcon
+from PyQt5.QtGui import QFont, QFontDatabase, QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
@@ -20,7 +22,8 @@ from PyQt5.QtWidgets import (
 )
 
 from pose_project.integration.configuration import (
-    DEFAULT_CONFIG, environment_report, is_stream_source, load_settings,
+    DEFAULT_CONFIG, DEFAULT_FRONT_MODE, FRONT_MODE_ITEMS, FRONT_MODE_VALUES, REID_RUNTIME_DEFAULTS,
+    environment_report, is_stream_source, load_settings, region_error,
     save_settings, validate, validate_video_source,
 )
 from pose_project.integration.controller import IntegrationController
@@ -52,12 +55,15 @@ def table(headers):
     widget.setEditTriggers(QTableWidget.NoEditTriggers)
     widget.setSelectionBehavior(QTableWidget.SelectRows)
     widget.setAlternatingRowColors(True)
+    widget.setWordWrap(False)
+    widget.verticalHeader().setDefaultSectionSize(28)
     widget.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+    widget.horizontalHeader().setResizeContentsPrecision(32)
     widget.horizontalHeader().setStretchLastSection(True)
     return widget
 
 
-def add_row(widget, values, payload=None, limit=500):
+def add_row(widget, values, payload=None, limit=500, autoscroll=True):
     if widget.rowCount() >= limit:
         widget.removeRow(0)
     row = widget.rowCount()
@@ -68,7 +74,8 @@ def add_row(widget, values, payload=None, limit=500):
         if payload is not None:
             item.setData(Qt.UserRole, payload)
         widget.setItem(row, column, item)
-    widget.scrollToBottom()
+    if autoscroll:
+        widget.scrollToBottom()
     return row
 
 
@@ -81,12 +88,16 @@ class IntegrationWindow(QMainWindow):
         self.previews = {}
         self._closing = False
         self._person_rows = {}
+        self._evidence = {}
+        self._latest_recognition = None
+        self._recognition_arrived = 0.0
         self.setWindowTitle("旅客与行李框 · 联调工作台")
         self.resize(1440, 940)
         self.setMinimumSize(1000, 720)
         self._build()
         self._apply()
         self.controller.frame.connect(self._frame)
+        self.controller.recognition.connect(self._recognition)
         self.controller.person.connect(self._person)
         self.controller.message.connect(self._message)
         self.controller.decision.connect(self._decision)
@@ -94,6 +105,10 @@ class IntegrationWindow(QMainWindow):
         self.controller.state.connect(self._state)
         self.controller.running_changed.connect(self._running)
         self.controller.stopped.connect(self._stopped)
+        self.result_timer = QTimer(self)
+        self.result_timer.setInterval(200)
+        self.result_timer.timeout.connect(self._refresh_recognition_age)
+        self.result_timer.start()
         self._running(False)
 
     def icon_button(self, icon, tooltip, callback):
@@ -212,15 +227,59 @@ class IntegrationWindow(QMainWindow):
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(2000)
         self.event_tabs.addTab(self.log_view, "运行日志")
+        recognition_panel = QWidget()
+        recognition_layout = QVBoxLayout(recognition_panel)
+        recognition_controls = QHBoxLayout()
+        self.recognition_age = QLabel("尚无检测结果")
+        self.show_detection_boxes = QCheckBox("显示检测框")
+        self.show_detection_boxes.setChecked(True)
+        self.show_detection_boxes.toggled.connect(self._refresh_recognition_age)
+        recognition_controls.addWidget(self.recognition_age, 1)
+        recognition_controls.addWidget(self.show_detection_boxes)
+        recognition_layout.addLayout(recognition_controls)
+        self.recognition_table = table(["区域", "轨迹", "候选旅客", "相似度", "状态", "坐标"])
+        self.recognition_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        recognition_layout.addWidget(self.recognition_table)
+        self.event_tabs.addTab(recognition_panel, "重识别结果")
+        performance_panel = QWidget()
+        performance_layout = QVBoxLayout(performance_panel)
+        self.debug_recording = QCheckBox("记录性能日志")
+        self.debug_recording.setChecked(self.settings.get("debug", {}).get("enabled", False))
+        self.debug_recording.toggled.connect(self.controller.set_debug)
+        performance_layout.addWidget(self.debug_recording)
+        self.performance_table = table(["指标", "当前值"])
+        performance_layout.addWidget(self.performance_table)
+        self.event_tabs.addTab(performance_panel, "性能调试")
+        evidence_panel = QWidget()
+        evidence_layout = QVBoxLayout(evidence_panel)
+        self.evidence_table = table([
+            "本地编号", "完整旅客编号", "闸机抓拍", "重识别状态",
+            "区域", "轨迹", "相似度", "绑定结果"])
+        self.evidence_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.evidence_table.itemSelectionChanged.connect(self._select_evidence)
+        evidence_layout.addWidget(self.evidence_table)
+        evidence_splitter = QSplitter(Qt.Horizontal)
+        self.evidence_gate_panel, self.evidence_gate_image = self._image_panel("闸机抓拍")
+        self.evidence_reid_panel, self.evidence_reid_image = self._image_panel(
+            "供框台当前目标")
+        evidence_splitter.addWidget(self.evidence_gate_panel)
+        evidence_splitter.addWidget(self.evidence_reid_panel)
+        evidence_splitter.setSizes([360, 360])
+        evidence_layout.addWidget(evidence_splitter, 1)
+        self.evidence_details = QPlainTextEdit()
+        self.evidence_details.setReadOnly(True)
+        self.evidence_details.setMaximumBlockCount(200)
+        self.evidence_details.setMaximumHeight(96)
+        evidence_layout.addWidget(self.evidence_details)
+        self.event_tabs.addTab(evidence_panel, "旅客证据")
         right.addWidget(self.event_tabs)
-        right.setSizes([480, 280])
+        right.setSizes([360, 400])
         horizontal.addWidget(right)
         horizontal.setSizes([330, 1080])
         root.addWidget(horizontal, 1)
         rfid_bar = QHBoxLayout()
         rfid_bar.addWidget(QLabel("RFID 测试注入"))
         self.rfid_region = QComboBox()
-        self.rfid_region.addItems(["A", "B"])
         rfid_bar.addWidget(self.rfid_region)
         self.rfid_text = QLineEdit()
         self.rfid_text.setPlaceholderText("行李框编号")
@@ -236,6 +295,21 @@ class IntegrationWindow(QMainWindow):
         rfid_bar.addWidget(self.import_button)
         root.addLayout(rfid_bar)
         self.setCentralWidget(central)
+
+    def _image_panel(self, title):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        heading = QLabel(title)
+        heading.setFont(QFont("Microsoft YaHei UI", 10, QFont.DemiBold))
+        layout.addWidget(heading)
+        image = QLabel("暂无图片")
+        image.setAlignment(Qt.AlignCenter)
+        image.setMinimumSize(280, 240)
+        image.setStyleSheet("background: #171c20; color: #a8b3ba;")
+        image.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        layout.addWidget(image, 1)
+        return panel, image
 
     def _tab_form(self, title):
         widget = QWidget()
@@ -289,30 +363,138 @@ class IntegrationWindow(QMainWindow):
     def _build_regions(self):
         form = self._tab_form("区域")
         self.region_enabled = {}
-        self.draw_buttons = []
-        gate = QPushButton("框选闸机抓拍区")
-        gate.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
-        gate.clicked.connect(lambda: self.canvases["gate"].begin_draw("gate"))
-        self.draw_buttons.append(gate)
-        form.addRow(gate)
+        self.draw_buttons, self.delete_buttons = {}, {}
+        self.region_status = {}
+        form.addRow(self._region_editor("gate", "闸机抓拍区"))
+        self.gate_region_status = QLabel()
+        form.addRow(self.gate_region_status)
         self.size_label = QLabel()
         form.addRow("供框台画面", self.size_label)
-        for region in ("A", "B"):
-            check = QCheckBox("启用 " + region)
-            self.region_enabled[region] = check
-            form.addRow(check)
-            for kind, name in (("roi_xyxy", "识别区"), ("operation_roi_xyxy", "操作区")):
-                target = region + "." + kind
-                button = QPushButton("框选 " + region + " " + name)
-                button.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
-                button.clicked.connect(
-                    lambda checked=False, value=target: self.canvases["reid"].begin_draw(value))
-                self.draw_buttons.append(button)
-                form.addRow(button)
+        self.add_region_button = QPushButton("新增供框台区域")
+        self.add_region_button.setIcon(self.style().standardIcon(QStyle.SP_FileDialogNewFolder))
+        self.add_region_button.clicked.connect(self.add_region)
+        form.addRow(self.add_region_button)
+        self.region_controls = QWidget()
+        self.region_form = QFormLayout(self.region_controls)
+        self.region_form.setContentsMargins(0, 0, 0, 0)
+        form.addRow(self.region_controls)
+        self._rebuild_region_controls()
         self.region_json = QPlainTextEdit()
         self.region_json.setReadOnly(True)
-        self.region_json.setMinimumHeight(210)
+        self.region_json.setMinimumHeight(150)
         form.addRow(self.region_json)
+
+    def _region_editor(self, target, title):
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        draw = QPushButton("框选" + title)
+        draw.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
+        draw.clicked.connect(lambda checked=False: self.begin_region_draw(target))
+        remove = self.icon_button(QStyle.SP_TrashIcon, "删除" + title,
+                                  lambda checked=False: self.delete_region(target))
+        self.draw_buttons[target], self.delete_buttons[target] = draw, remove
+        layout.addWidget(draw, 1)
+        layout.addWidget(remove)
+        return row
+
+    def _rebuild_region_controls(self):
+        while self.region_form.rowCount():
+            self.region_form.removeRow(0)
+        self.region_enabled, self.region_status = {}, {}
+        self.region_front_modes = {}
+        self.draw_buttons = {"gate": self.draw_buttons["gate"]}
+        self.delete_buttons = {"gate": self.delete_buttons["gate"]}
+        for region in self.settings["binding"]["regions"]:
+            header = QWidget()
+            layout = QHBoxLayout(header)
+            layout.setContentsMargins(0, 0, 0, 0)
+            check = QCheckBox("启用 " + region)
+            check.setChecked(region in self.settings["reid"]["enabled_regions"])
+            check.toggled.connect(self._region_toggled)
+            self.region_enabled[region] = check
+            remove = self.icon_button(QStyle.SP_TrashIcon, "删除 " + region + " 整组区域",
+                lambda checked=False, name=region: self.delete_region(name))
+            self.delete_buttons[region] = remove
+            layout.addWidget(check, 1)
+            layout.addWidget(remove)
+            self.region_form.addRow(header)
+            self.region_form.addRow(self._region_editor(
+                region + ".roi_xyxy", " " + region + " 区域"))
+            front_mode = QComboBox()
+            for label, value in zip(FRONT_MODE_ITEMS, FRONT_MODE_VALUES):
+                front_mode.addItem(label, value)
+            current = self.settings["binding"]["regions"][region].get(
+                "front_mode", DEFAULT_FRONT_MODE)
+            front_mode.setCurrentIndex(
+                FRONT_MODE_VALUES.index(current)
+                if current in FRONT_MODE_VALUES else 0)
+            front_mode.currentIndexChanged.connect(
+                lambda index, name=region: self._front_mode_changed(name, index))
+            self.region_front_modes[region] = front_mode
+            self.region_form.addRow("多人排队", front_mode)
+            status = QLabel()
+            status.setWordWrap(True)
+            self.region_status[region] = status
+            self.region_form.addRow(status)
+
+    def _front_mode_changed(self, region, index):
+        if region not in self.settings["binding"]["regions"]:
+            return
+        mode = FRONT_MODE_VALUES[index] if 0 <= index < len(FRONT_MODE_VALUES) else None
+        self.settings["binding"]["regions"][region]["front_mode"] = mode
+        self._update_regions()
+        self._save_region_config()
+
+    def _region_toggled(self):
+        self.settings["reid"]["enabled_regions"] = [
+            key for key, check in self.region_enabled.items() if check.isChecked()]
+        self._update_regions()
+
+    def add_region(self):
+        if self.controller.running:
+            return
+        regions = self.settings["binding"]["regions"]
+        name = next((letter for letter in string.ascii_uppercase if letter not in regions), None)
+        if name is None:
+            self.error("供框台区域编号 A 到 Z 已用完")
+            return
+        regions[name] = {}
+        self.settings["reid"]["enabled_regions"].append(name)
+        self._rebuild_region_controls()
+        self._update_regions()
+
+    def delete_region(self, target):
+        if self.controller.running:
+            return
+        for canvas in self.canvases.values():
+            canvas.cancel_draw()
+        if target == "gate":
+            self.settings["gate"]["roi"] = None
+        elif "." not in target:
+            self.settings["binding"]["regions"].pop(target, None)
+            self.settings["reid"]["enabled_regions"] = [
+                key for key in self.settings["reid"]["enabled_regions"] if key != target]
+            self._rebuild_region_controls()
+        else:
+            name, kind = target.split(".")
+            region = self.settings["binding"]["regions"][name]
+            region.pop(kind, None)
+            if kind == "roi_xyxy":
+                region.pop("operation_roi_xyxy", None)
+        self._update_regions()
+
+    def begin_region_draw(self, target):
+        if self.controller.running:
+            return
+        stage = "gate" if target == "gate" else "reid"
+        canvas = self.canvases[stage]
+        if canvas.image.isNull():
+            self.error("请先读取{}视频首帧".format("闸机" if stage == "gate" else "供框台"))
+            return
+        for view in self.canvases.values():
+            view.cancel_draw()
+        canvas.begin_draw(target)
 
     def _build_connection(self):
         form = self._tab_form("连接")
@@ -342,6 +524,19 @@ class IntegrationWindow(QMainWindow):
         self.threshold.setRange(0, 1)
         self.threshold.setSingleStep(0.01)
         form.addRow("重识别阈值", self.threshold)
+        self.reid_controls = {}
+        for name, lower, upper, step, suffix, label in (
+                ("sample_interval_ms", 50, 1000, 50, " ms", "识别间隔"),
+                ("detector_image_size", 320, 1280, 32, " px", "检测输入尺寸"),
+                ("preview_fps", 1, 30, 1, " fps", "预览帧率")):
+            control = QSpinBox()
+            control.setRange(lower, upper)
+            control.setSingleStep(step)
+            control.setSuffix(suffix)
+            self.reid_controls[name] = control
+            form.addRow(label, control)
+        self.flip_tta = QCheckBox("重识别翻转增强")
+        form.addRow(self.flip_tta)
         self.parameters = {}
         labels = {"lookback_ms": "历史范围", "min_dwell_ms": "最少有效停留",
                   "binding_wait_ms": "绑定等待", "max_sample_gap_ms": "最大采样间隔",
@@ -372,6 +567,9 @@ class IntegrationWindow(QMainWindow):
         self.reid_path.setText(settings["reid"]["reid_weights"])
         self.output_path.setText(settings["output_dir"])
         self.threshold.setValue(settings["reid"]["threshold"])
+        for name, control in self.reid_controls.items():
+            control.setValue(settings["reid"].get(name, REID_RUNTIME_DEFAULTS[name]))
+        self.flip_tta.setChecked(settings["reid"].get("flip_tta", True))
         self.transport.setCurrentIndex(self.transport.findData(settings["transport"]))
         mqtt = settings["mqtt"]
         self.host.setText(mqtt["host"])
@@ -406,6 +604,11 @@ class IntegrationWindow(QMainWindow):
             detector_weights=self.detector_path.text().strip(),
             reid_weights=self.reid_path.text().strip(),
             enabled_regions=[key for key, box in self.region_enabled.items() if box.isChecked()])
+        settings["reid"].update({name: control.value() for name, control in self.reid_controls.items()})
+        settings["reid"]["flip_tta"] = self.flip_tta.isChecked()
+        settings["debug"] = {"enabled": self.debug_recording.isChecked()}
+        for name, control in self.region_front_modes.items():
+            settings["binding"]["regions"][name]["front_mode"] = control.currentData()
         settings["binding"]["binding_parameters"] = {
             key: widget.value() for key, widget in self.parameters.items()}
         settings["transport"] = self.transport.currentData()
@@ -468,7 +671,9 @@ class IntegrationWindow(QMainWindow):
             old_width, old_height = self.settings["reid"]["image_size"]
             if [width, height] != [old_width, old_height]:
                 for region in self.settings["binding"]["regions"].values():
-                    for kind in ("roi_xyxy", "operation_roi_xyxy"):
+                    for kind in ("roi_xyxy",):
+                        if region.get(kind) is None:
+                            continue
                         region[kind] = [
                             round(v * (width / old_width if i % 2 == 0 else height / old_height), 2)
                             for i, v in enumerate(region[kind])]
@@ -478,8 +683,97 @@ class IntegrationWindow(QMainWindow):
         self._update_regions()
 
     def _frame(self, stage, image):
+        previous_size = (self.canvases[stage].image.width(), self.canvases[stage].image.height())
         self.canvases[stage].set_frame(image)
-        self._update_regions()
+        if previous_size != (image.shape[1], image.shape[0]):
+            self._update_regions()
+
+    def _recognition(self, report):
+        self._latest_recognition = report
+        self._recognition_arrived = time.monotonic()
+        reid_frame = report.get("_frame")
+        if reid_frame is None:
+            reid_frame = self.canvases["reid"].image.copy()
+        result_scroll = self.recognition_table.verticalScrollBar().value()
+        statuses = {"matched": "已匹配", "below_threshold": "未达阈值",
+                    "warming_track": "轨迹确认中", "no_gallery": "等待旅客入库",
+                    "waiting_track": "等待稳定轨迹",
+                    "passenger_locked": "旅客已完成匹配，不再分配",
+                    "duplicate": "身份重复，未采用"}
+        self.recognition_table.setUpdatesEnabled(False)
+        self.recognition_table.setRowCount(0)
+        for region, result in report["regions"].items():
+            for candidate in result["candidates"]:
+                passenger = candidate.get("label")
+                if passenger and candidate.get("status") not in (
+                        "passenger_locked", "duplicate", "waiting_track"):
+                    evidence = self._evidence.setdefault(passenger, {
+                        "passenger_id": passenger,
+                        "local_id": candidate.get("display_label", ""),
+                    })
+                    evidence["recognition"] = {
+                        "region": region,
+                        "tid": candidate.get("tid", ""),
+                        "score": candidate.get("score"),
+                        "status": candidate.get("status", ""),
+                        "identity_locked": candidate.get("identity_locked", False),
+                        "bbox_xyxy": candidate.get("bbox_xyxy"),
+                        "captured_at_ms": report.get("captured_at_ms"),
+                        "completed_at_ms": report.get("completed_at_ms"),
+                        "frame": reid_frame,
+                    }
+                score = candidate.get("score")
+                add_row(self.recognition_table, [
+                    region, candidate.get("tid", ""), candidate.get("label") or "未识别",
+                    "{:.3f}".format(score) if score is not None else "",
+                    statuses.get(candidate["status"], candidate["status"]),
+                    str(candidate["bbox_xyxy"])], limit=1000, autoscroll=False)
+        self.recognition_table.verticalScrollBar().setValue(result_scroll)
+        self.recognition_table.setUpdatesEnabled(True)
+        metrics = report["metrics"]
+        labels = {
+            "device": "推理设备", "capture_fps": "采集帧率", "inference_fps": "识别帧率",
+            "processing_ms": "整帧处理 ms", "detection_ms": "人体检测 ms",
+            "reid_ms": "特征提取 ms", "matching_ms": "身份比对及绘制 ms",
+            "input_age_ms": "取帧时图像年龄 ms", "worker_age_ms": "识别完成时位置延迟 ms",
+            "ui_delivery_ms": "界面接收等待 ms", "gallery_ms": "本次旅客入库 ms",
+            "gallery_count": "旅客库人数", "gallery_pending": "等待入库条数",
+            "processed": "已识别帧数", "skipped": "累计跳过旧帧数",
+            "reconnects": "取流重连次数", "mqtt_pending": "MQTT 等待发送条数",
+            "message_pending": "等待处理消息数", "position_age_ms": "各区域接收位置延迟 ms",
+        }
+        self.performance_table.setUpdatesEnabled(False)
+        performance_scroll = self.performance_table.verticalScrollBar().value()
+        self.performance_table.setRowCount(0)
+        for key, label in labels.items():
+            if key in metrics:
+                value = metrics[key]
+                add_row(self.performance_table, [label,
+                    "{:.2f}".format(value) if isinstance(value, float) else value],
+                        autoscroll=False)
+        self.performance_table.verticalScrollBar().setValue(performance_scroll)
+        self.performance_table.setUpdatesEnabled(True)
+        self._refresh_evidence_table()
+        self._refresh_recognition_age()
+
+    def _refresh_recognition_age(self):
+        report = self._latest_recognition
+        if report is None:
+            return
+        # Use monotonic elapsed time; the capture epoch belongs to the session clock.
+        age = (max(0, report["completed_at_ms"] - report["captured_at_ms"])
+               + report["metrics"].get("ui_delivery_ms", 0)
+               + int((time.monotonic() - self._recognition_arrived) * 1000))
+        valid = age <= self.parameters["max_position_age_ms"].value()
+        self.recognition_age.setText("结果年龄 {} ms / {}".format(
+            age, "有效" if valid and self.controller.running else "已过期"))
+        self.recognition_age.setStyleSheet("color: {};".format("#216d57" if valid else "#ad3f38"))
+        canvas = self.canvases["reid"]
+        canvas.detections = [
+            candidate for region in report["regions"].values()
+            for candidate in region["candidates"]
+        ] if valid and self.controller.running and self.show_detection_boxes.isChecked() else []
+        canvas.update()
 
     def _rectangle(self, target, box):
         if self.controller.running:
@@ -487,30 +781,71 @@ class IntegrationWindow(QMainWindow):
         if target == "gate":
             canvas = self.canvases["gate"]
             width, height = canvas.image.width(), canvas.image.height()
+            if not width or not height:
+                return
             self.settings["gate"]["roi"] = {
                 "x": box[0] / width, "y": box[1] / height,
                 "w": (box[2] - box[0]) / width, "h": (box[3] - box[1]) / height}
         else:
-            region, kind = target.split(".")
-            self.settings["binding"]["regions"][region][kind] = box
+            name, kind = target.split(".")
+            region = self.settings["binding"]["regions"].get(name)
+            if region is None:
+                return
+            region[kind] = box
         self._update_regions()
+        self._save_region_config()
+
+    def _save_region_config(self):
+        try:
+            save_settings(self.collect(), self.config_path)
+            self.controller.write_log("区域配置已自动保存：" + str(self.config_path))
+        except (ValueError, OSError, KeyError, TypeError) as exc:
+            self.error("区域配置自动保存失败：{}".format(exc))
 
     def _update_regions(self):
         width, height = self.settings["reid"]["image_size"]
         self.size_label.setText("{} × {}".format(width, height))
-        self.region_json.setPlainText(json.dumps(self.settings["binding"]["regions"],
-                                                ensure_ascii=False, indent=2))
+        regions = self.settings["binding"]["regions"]
+        text = json.dumps(regions, ensure_ascii=False, indent=2)
+        if self.region_json.toPlainText() != text:
+            self.region_json.setPlainText(text)
+        active = []
+        for name, geometry in regions.items():
+            problem = region_error(name, geometry, (width, height))
+            enabled = self.region_enabled[name].isChecked()
+            self.region_status[name].setText(problem or ("已启用" if enabled else "未启用"))
+            self.region_status[name].setStyleSheet(
+                "color: {};".format("#ad3f38" if problem else "#216d57"))
+            if enabled and not problem:
+                active.append(name)
+            kind = "roi_xyxy"
+            exists = geometry.get(kind) is not None
+            target = name + "." + kind
+            self.draw_buttons[target].setText(
+                "{} {} 区域".format("重画" if exists else "新增", name))
+            self.delete_buttons[target].setEnabled(exists)
+        current = self.rfid_region.currentText()
+        if [self.rfid_region.itemText(i) for i in range(self.rfid_region.count())] != active:
+            self.rfid_region.clear()
+            self.rfid_region.addItems(active)
+            if current in active:
+                self.rfid_region.setCurrentText(current)
+        self.add_region_button.setEnabled(len(regions) < 26)
         self.canvases["reid"].overlays = {
-            region + (" 识别区" if kind == "roi_xyxy" else " 操作区"):
-                (box, "#e4b642" if kind == "roi_xyxy" else "#29cda2")
-            for region, geometry in self.settings["binding"]["regions"].items()
-            for kind, box in geometry.items()}
+            region + " 区域": (box, "#e4b642")
+            for region, geometry in regions.items()
+            for kind, box in geometry.items()
+            if kind == "roi_xyxy" and box is not None}
         gate = self.canvases["gate"]
-        roi = self.settings["gate"]["roi"]
+        roi = self.settings["gate"].get("roi")
         w, h = gate.image.width(), gate.image.height()
-        gate.overlays = {"抓拍区": ([roi["x"] * w, roi["y"] * h,
+        gate.overlays = {} if roi is None else {"抓拍区": ([roi["x"] * w, roi["y"] * h,
                                      (roi["x"] + roi["w"]) * w,
                                      (roi["y"] + roi["h"]) * h], "#e4b642")}
+        self.draw_buttons["gate"].setText("新增闸机抓拍区" if roi is None else "重画闸机抓拍区")
+        self.delete_buttons["gate"].setEnabled(roi is not None)
+        self.gate_region_status.setText("缺少闸机抓拍区" if roi is None else "")
+        self.gate_region_status.setStyleSheet("color: #ad3f38;")
         for canvas in self.canvases.values():
             canvas.update()
 
@@ -528,7 +863,17 @@ class IntegrationWindow(QMainWindow):
             self.results_table.setRowCount(0)
             self.messages_table.setRowCount(0)
             self.people_table.setRowCount(0)
+            self.recognition_table.setRowCount(0)
+            self.performance_table.setRowCount(0)
+            self._latest_recognition = None
+            self.recognition_age.setText("尚无检测结果")
+            self.canvases["reid"].detections = []
             self._person_rows.clear()
+            self._evidence.clear()
+            self.evidence_table.setRowCount(0)
+            self.evidence_details.clear()
+            self._set_evidence_image(self.evidence_gate_image, None, "暂无闸机抓拍")
+            self._set_evidence_image(self.evidence_reid_image, None, "暂无供框台目标")
             self.event_tabs.setTabText(2, "旅客库")
             self.details.clear()
             self.session_label.setText("运行中")
@@ -542,6 +887,9 @@ class IntegrationWindow(QMainWindow):
         self.controller.stop()
 
     def _running(self, running):
+        if running:
+            for canvas in self.canvases.values():
+                canvas.cancel_draw()
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.settings_tabs.setEnabled(not running)
@@ -564,8 +912,13 @@ class IntegrationWindow(QMainWindow):
             "#ad3f38" if "错误" in text or "失败" in text else "#216d57"))
 
     def _person(self, payload):
-        from PyQt5.QtGui import QImage, QPixmap
         passenger = payload["passenger_id"]
+        evidence = self._evidence.setdefault(passenger, {"passenger_id": passenger})
+        evidence.update({
+            "local_id": payload.get("local_id", ""),
+            "capture_time": payload.get("capture_time", ""),
+            "gate_image": payload.get("image"),
+        })
         row = self._person_rows.get(passenger)
         if row is None:
             row = add_row(self.people_table, ["", payload["local_id"],
@@ -577,6 +930,7 @@ class IntegrationWindow(QMainWindow):
         self.people_table.item(row, 0).setIcon(QIcon(QPixmap.fromImage(qimage)))
         self.people_table.setRowHeight(row, 68)
         self.event_tabs.setTabText(2, "旅客库 ({})".format(len(self._person_rows)))
+        self._refresh_evidence_table()
 
     def _message(self, record):
         payload = record["payload"]
@@ -604,6 +958,126 @@ class IntegrationWindow(QMainWindow):
         add_row(self.results_table, [result["roi_id"], result["passenger_id"] or "",
             result["rfid"], statuses.get(result["status"], result["status"]),
             reasons.get(result["reason"], result["reason"])], result)
+        passenger = result.get("passenger_id")
+        if passenger:
+            evidence = self._evidence.setdefault(passenger, {"passenger_id": passenger})
+            evidence["binding"] = result
+            self._refresh_evidence_table()
+
+    def _refresh_evidence_table(self):
+        selected = self._selected_evidence_id()
+        self.evidence_table.blockSignals(True)
+        self.evidence_table.setRowCount(0)
+        statuses = {
+            "matched": "已匹配",
+            "below_threshold": "未达阈值",
+            "warming_track": "轨迹确认中",
+            "duplicate": "身份重复，未采用",
+        }
+        binding_statuses = {"bound": "已绑定", "unbound": "未绑定",
+                            "deferred": "多人符合"}
+        for passenger, evidence in self._evidence.items():
+            recognition = evidence.get("recognition") or {}
+            binding = evidence.get("binding") or {}
+            score = recognition.get("score")
+            add_row(self.evidence_table, [
+                evidence.get("local_id", ""),
+                passenger,
+                "已采集" if evidence.get("gate_image") is not None else "无",
+                ("已匹配，任务锁定" if recognition.get("identity_locked") and
+                 recognition.get("status") == "matched" else
+                 statuses.get(recognition.get("status"), "等待重识别")),
+                recognition.get("region", ""),
+                recognition.get("tid", ""),
+                "{:.3f}".format(score) if score is not None else "",
+                binding_statuses.get(binding.get("status"), "未触发"),
+            ], passenger, limit=256, autoscroll=False)
+        self.evidence_table.blockSignals(False)
+        if selected:
+            for row in range(self.evidence_table.rowCount()):
+                item = self.evidence_table.item(row, 0)
+                if item and item.data(Qt.UserRole) == selected:
+                    self.evidence_table.selectRow(row)
+                    break
+        if self.evidence_table.currentRow() < 0 and self.evidence_table.rowCount():
+            self.evidence_table.selectRow(self.evidence_table.rowCount() - 1)
+
+    def _selected_evidence_id(self):
+        items = self.evidence_table.selectedItems()
+        return items[0].data(Qt.UserRole) if items else None
+
+    def _set_evidence_image(self, label, image, message):
+        if image is None:
+            label.setPixmap(QPixmap())
+            label.setText(message)
+            return
+        if hasattr(image, "isNull"):
+            qimage = image
+        else:
+            rgb = image[:, :, ::-1].copy()
+            height, width = rgb.shape[:2]
+            qimage = QImage(rgb.data, width, height, rgb.strides[0],
+                            QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(qimage)
+        label.setText("")
+        label.setPixmap(pixmap.scaled(
+            max(1, label.width() - 8), max(1, label.height() - 8),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def _select_evidence(self):
+        passenger = self._selected_evidence_id()
+        if not passenger:
+            self.evidence_details.clear()
+            self._set_evidence_image(self.evidence_gate_image, None, "暂无闸机抓拍")
+            self._set_evidence_image(self.evidence_reid_image, None, "暂无供框台目标")
+            return
+        evidence = self._evidence.get(passenger, {})
+        recognition = evidence.get("recognition") or {}
+        binding = evidence.get("binding") or {}
+        self._set_evidence_image(
+            self.evidence_gate_image, evidence.get("gate_image"), "暂无闸机抓拍")
+        reid_image = recognition.get("frame")
+        box = recognition.get("bbox_xyxy")
+        if reid_image is not None and box:
+            x1, y1, x2, y2 = [int(value) for value in box]
+            if hasattr(reid_image, "width"):
+                x1 = max(0, min(reid_image.width(), x1))
+                y1 = max(0, min(reid_image.height(), y1))
+                x2 = max(x1, min(reid_image.width(), x2))
+                y2 = max(y1, min(reid_image.height(), y2))
+                reid_image = reid_image.copy(x1, y1, x2 - x1, y2 - y1)
+            else:
+                height, width = reid_image.shape[:2]
+                x1 = max(0, min(width, x1))
+                y1 = max(0, min(height, y1))
+                x2 = max(x1, min(width, x2))
+                y2 = max(y1, min(height, y2))
+                reid_image = reid_image[y1:y2, x1:x2]
+        else:
+            reid_image = None
+        self._set_evidence_image(
+            self.evidence_reid_image, reid_image, "暂无供框台目标")
+        details = {
+            "passenger_id": passenger,
+            "local_id": evidence.get("local_id", ""),
+            "gate_capture_time": evidence.get("capture_time", ""),
+            "recognition": {
+                "region": recognition.get("region", ""),
+                "track_id": recognition.get("tid", ""),
+                "score": recognition.get("score"),
+                "status": recognition.get("status", ""),
+                "captured_at_ms": recognition.get("captured_at_ms"),
+                "completed_at_ms": recognition.get("completed_at_ms"),
+                "bbox_xyxy": recognition.get("bbox_xyxy"),
+            },
+            "binding": {
+                "status": binding.get("status", ""),
+                "roi_id": binding.get("roi_id", ""),
+                "rfid": binding.get("rfid", ""),
+                "reason": binding.get("reason", ""),
+            },
+        }
+        self.evidence_details.setPlainText(json.dumps(details, ensure_ascii=False, indent=2))
 
     def send_rfid(self):
         try:
@@ -655,7 +1129,7 @@ def self_test(settings):
     base = controller.inbox.now() - 6200
     passenger = uuid.uuid4().hex + "-" + datetime.now().strftime("%Y-%m-%d")
     region = settings["reid"]["enabled_regions"][0]
-    operation = settings["binding"]["regions"][region]["operation_roi_xyxy"]
+    operation = settings["binding"]["regions"][region]["roi_xyxy"]
     cx, cy = (operation[0] + operation[2]) / 2, (operation[1] + operation[3]) / 2
     topic = settings["binding"]["topics"]["detections"]
     results = []

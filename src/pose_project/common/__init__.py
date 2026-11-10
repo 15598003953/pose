@@ -1,1 +1,1 @@
-"""Shared project resources."""
+"""项目共用资源路径。"""

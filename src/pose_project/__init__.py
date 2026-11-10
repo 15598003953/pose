@@ -1,1 +1,1 @@
-"""Video pose analysis and passenger-to-tray binding."""
+"""机场旅客抓拍、重识别和行李框绑定。"""

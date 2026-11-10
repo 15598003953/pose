@@ -1,4 +1,4 @@
-"""Image canvases with calibrated, letterbox-aware rectangle editing."""
+"""视频画面与区域编辑：换算缩放、留白和原图坐标，保证框选位置一致。"""
 
 from PyQt5.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen
@@ -13,6 +13,7 @@ class VideoCanvas(QWidget):
         self.title = title
         self.image = QImage()
         self.overlays = {}
+        self.detections = []
         self.target = None
         self.origin = self.endpoint = None
         self.setMinimumSize(240, 210)
@@ -33,8 +34,14 @@ class VideoCanvas(QWidget):
         return QRectF((self.width() - width) / 2, (self.height() - height) / 2, width, height)
 
     def begin_draw(self, target):
+        self.cancel_draw()
         self.target = target
         self.setCursor(Qt.CrossCursor)
+
+    def cancel_draw(self):
+        self.origin = self.endpoint = self.target = None
+        self.unsetCursor()
+        self.update()
 
     def _point(self, position):
         rect = self.image_rect()
@@ -84,6 +91,24 @@ class VideoCanvas(QWidget):
             painter.setPen(QPen(QColor(color), 2))
             painter.drawRect(QRectF(box[0], box[1], box[2] - box[0], box[3] - box[1]))
             painter.drawText(QPointF(box[0] + 5, box[1] + 18), label)
+        font = painter.font()
+        font.setPixelSize(28)
+        painter.setFont(font)
+        for detection in self.detections:
+            box = detection["bbox_xyxy"]
+            color = "#35db84" if detection["status"] == "matched" else "#ffbd53"
+            painter.setPen(QPen(QColor(color), 3))
+            painter.drawRect(QRectF(box[0], box[1], box[2] - box[0], box[3] - box[1]))
+            label = ("#" + str(detection.get("tid", "?")))
+            if detection["status"] == "matched":
+                label = detection.get("display_label") or label
+                if len(label) > 12:
+                    label = label[:12] + "..."
+            score = detection.get("score")
+            if score is not None:
+                label += " {:.2f}".format(score)
+            if box[2] - box[0] >= 100:
+                painter.drawText(QPointF(box[0] + 4, max(30, box[1] - 8)), label)
         if self.origin is not None:
             painter.setPen(QPen(QColor("#ffffff"), 2, Qt.DashLine))
             painter.drawRect(QRectF(self.origin, self.endpoint).normalized())

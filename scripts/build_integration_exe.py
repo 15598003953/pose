@@ -1,12 +1,14 @@
-"""Build a relocatable Windows directory with EXE, models and local libraries."""
+"""构建 Windows 便携发布目录；收集模型、配置、运行库，并生成校验清单。"""
 
 import argparse
 from datetime import datetime
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -27,7 +29,7 @@ def sha256(path):
 
 
 def prepare_vc_runtime(bundle):
-    # Qt ships older copies; loading those first prevents current Torch from starting.
+    # Qt 自带的旧运行库会阻止当前 Torch 启动，发布时统一使用构建环境的版本。
     names = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
     for name in names:
         source = Path(sys.base_prefix) / name
@@ -71,12 +73,15 @@ def archive_bundle(bundle, archive):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--name", default="PoseIntegration", help="Executable and bundle name")
     parser.add_argument("--no-archive", action="store_true")
     args = parser.parse_args()
     if sys.platform != "win32" or platform.architecture()[0] != "64bit":
         parser.error("Build this package with 64-bit Python on Windows")
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", args.name):
+        parser.error("Name must start with a letter and contain only letters, digits, _ or -")
     output = (args.output or ROOT / "dist" /
-              ("PoseIntegration_win64_" + datetime.now().strftime("%Y%m%d_%H%M%S"))).resolve()
+              (args.name + "_win64_" + datetime.now().strftime("%Y%m%d_%H%M%S"))).resolve()
     if output.exists():
         parser.error("Output already exists; choose a new directory")
     output.mkdir(parents=True)
@@ -85,8 +90,9 @@ def main():
                "--distpath", str(output), "--workpath", str(work),
                str(ROOT / "packaging/integration.spec")]
     print("Building " + str(output), flush=True)
-    subprocess.run(command, cwd=ROOT, check=True)
-    bundle = output / "PoseIntegration"
+    subprocess.run(command, cwd=ROOT, check=True,
+                   env=dict(os.environ, POSE_EXE_NAME=args.name))
+    bundle = output / args.name
     prepare_vc_runtime(bundle)
     config_dir = bundle / "configs"
     config_dir.mkdir()
@@ -94,8 +100,8 @@ def main():
     settings["transport"] = "local"
     settings["gate"]["source"] = ""
     settings["reid"].update(
-        source="", detector_weights="../_internal/reid1026001/yolov8s.pt",
-        reid_weights="../_internal/reid1026001/weights/msmt_sbs_R50.pth")
+        source="", detector_weights="../_internal/models/reid/yolov8s.pt",
+        reid_weights="../_internal/models/reid/msmt_sbs_R50.pth")
     settings["mqtt"].update(host="127.0.0.1", username="", output_enabled=False)
     settings["mqtt"].pop("password", None)
     settings["output_dir"] = "../result/integration"
@@ -103,8 +109,11 @@ def main():
         json.dumps(settings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     shutil.copy2(ROOT / "configs/binding_config.json", config_dir / "binding_config.json")
     for name in ("start_server.cmd", "check_environment.cmd"):
-        shutil.copy2(ROOT / "packaging" / name, bundle / name)
-    shutil.copy2(ROOT / "docs/EXE_DEPLOYMENT.md", bundle / "README.md")
+        text = (ROOT / "packaging" / name).read_text(encoding="utf-8")
+        (bundle / name).write_text(text.replace("PoseIntegration", args.name),
+                                  encoding="utf-8", newline="\r\n")
+    text = (ROOT / "docs/EXE_DEPLOYMENT.md").read_text(encoding="utf-8")
+    (bundle / "README.md").write_text(text.replace("PoseIntegration", args.name), encoding="utf-8")
     shutil.copy2(ROOT / "LICENSE", bundle / "LICENSE")
     versions = {}
     license_dir = bundle / "licenses"
@@ -124,6 +133,7 @@ def main():
                     shutil.copy2(source, destination)
     (bundle / "build_info.json").write_text(json.dumps({
         "created_at": datetime.now().astimezone().isoformat(),
+        "executable": args.name + ".exe",
         "platform": platform.platform(), "python": platform.python_version(),
         "versions": versions, "layout": "PyInstaller onedir, console enabled",
         "optional_modules_excluded": ["mediapipe", "onnxruntime"],

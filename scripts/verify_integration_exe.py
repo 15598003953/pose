@@ -1,4 +1,4 @@
-"""Verify a copied EXE bundle without Conda or source paths in its environment."""
+"""独立验证复制后的 EXE 目录；运行环境不引用 Conda 和项目源码路径。"""
 
 import argparse
 from copy import deepcopy
@@ -44,7 +44,7 @@ def main():
     if output.exists():
         parser.error("Verification output must be new")
     output.mkdir(parents=True)
-    portable = output / "portable" / "PoseIntegration"
+    portable = output / "portable" / args.bundle.name
     print("Copying release to " + str(portable), flush=True)
     shutil.copytree(args.bundle.resolve(), portable)
     manifest = json.loads((portable / "manifest.json").read_text(encoding="utf-8"))
@@ -61,24 +61,26 @@ def main():
     windows = Path(os.environ.get("WINDIR", "C:/Windows"))
     env.update(PATH=str(windows / "System32") + os.pathsep + str(windows),
                QT_QPA_PLATFORM="offscreen")
-    executable = portable / "PoseIntegration.exe"
+    build_info = json.loads((portable / "build_info.json").read_text(encoding="utf-8"))
+    executable = portable / build_info.get("executable", "PoseIntegration.exe")
     checks = {}
     report = {"ok": False, "bundle": str(portable), "manifest_files": len(manifest),
               "conda_environment_removed": True, "checks": checks}
 
-    def run(name, *arguments, extra_env=None, timeout=180):
+    def run(name, *arguments, extra_env=None, timeout=180, expected_code=0):
         started = time.monotonic()
         result = subprocess.run([str(executable), *arguments], cwd=output,
             env=dict(env, **(extra_env or {})), capture_output=True, encoding="utf-8",
             errors="replace", timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW)
         (output / (name + ".log")).write_text(result.stdout + result.stderr, encoding="utf-8")
         checks[name] = {"exit_code": result.returncode,
+                        "expected_exit_code": expected_code,
                         "seconds": round(time.monotonic() - started, 3)}
         print("{}: exit={} {:.1f}s".format(name, result.returncode,
                                           checks[name]["seconds"]), flush=True)
-        if result.returncode:
+        if result.returncode != expected_code:
             raise RuntimeError(name + " failed; see " + str(output / (name + ".log")))
-        return result.stdout
+        return result.stdout + result.stderr
 
     processes, handles = [], []
     try:
@@ -106,6 +108,29 @@ def main():
         settings["output_dir"] = str(output / "sessions")
         for key in ("detector_weights", "reid_weights"):
             settings["reid"][key] = str((portable / "configs" / settings["reid"][key]).resolve())
+        regions = deepcopy(settings)
+        regions["binding"]["regions"]["C"] = deepcopy(regions["binding"]["regions"]["A"])
+        regions["binding"]["regions"]["B"] = {}
+        regions["reid"]["enabled_regions"] = ["C"]
+        regions["output_dir"] = str(output / "region_sessions")
+        region_config = output / "regions_config.json"
+        region_config.write_text(json.dumps(regions, ensure_ascii=False, indent=2), encoding="utf-8")
+        info = report_json(run("new_region_binding", "--config", str(region_config), "--self-test"))
+        checks["new_region_binding"]["report"] = info
+        if not info.get("ok") or info["decisions"][0]["roi_id"] != "C":
+            raise RuntimeError("New region or disabled-region filtering failed")
+        del regions["binding"]["regions"]["C"]["roi_xyxy"]
+        region_config.write_text(json.dumps(regions, ensure_ascii=False, indent=2), encoding="utf-8")
+        run("incomplete_region_gui", "--config", str(region_config), "--duration", "2")
+        text = run("incomplete_region_rejected", "--config", str(region_config), "--headless",
+                   expected_code=1)
+        if "C 区缺少区域" not in text:
+            raise RuntimeError("Missing localized region validation message")
+        regions["binding"]["regions"] = {}
+        regions["reid"]["enabled_regions"] = []
+        regions["gate"]["roi"] = None
+        region_config.write_text(json.dumps(regions, ensure_ascii=False, indent=2), encoding="utf-8")
+        run("deleted_regions_gui", "--config", str(region_config), "--duration", "2")
         local_config = output / "file_config.json"
         local_config.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
         run("local_video", "--config", str(local_config), "--headless", "--duration", "15")

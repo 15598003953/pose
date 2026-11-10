@@ -1,7 +1,8 @@
-"""Exercise local models, both workers, and the redesigned workbench."""
+"""用本地视频和真实模型验证两路后台任务、旅客入库及联合界面。"""
 
 import argparse
 from copy import deepcopy
+from importlib import import_module
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ from PyQt5.QtWidgets import QApplication
 from pose_project.apps.integration_app import IntegrationWindow, configure_application
 from pose_project.common.project_paths import ROOT
 from pose_project.integration.configuration import defaults, new_run_directory
-from pose_project.integration.workers import encode_image, legacy_module
+from pose_project.integration.workers import encode_image
 
 
 def make_clip(source, output, count, rotate=False):
@@ -70,13 +71,13 @@ def main():
     gate_clip, reid_clip = output / "gate_clip.mp4", output / "reid_clip.mp4"
     gate_frames = make_clip(
         ROOT / "data/BC5496691_1_20260923T180406Z_20260923T182102Z.mp4", gate_clip, 30)
-    reid_frames = make_clip(ROOT / "reid1026001/_test_src.mp4", reid_clip, 100)
+    reid_frames = make_clip(ROOT / "data/verification/reid_sample.mp4", reid_clip, 100)
     capture = cv2.VideoCapture(str(reid_clip))
     ok, image = capture.read()
     capture.release()
     if not ok:
         raise RuntimeError("Could not decode Re-ID fixture")
-    module = legacy_module("reid1026001", "main.py")
+    module = import_module("pose_project.reid.search_worker")
     detector = module.PersonDetector(weights=settings["reid"]["detector_weights"],
                                      allow_download=False)
     boxes, scores = detector.detect(image)

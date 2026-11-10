@@ -1,1 +1,1 @@
-"""Passenger-to-tray binding, interfaces and simulated replay."""
+"""旅客与行李框绑定算法、实时接口和模拟回放。"""

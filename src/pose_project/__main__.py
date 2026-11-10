@@ -1,4 +1,4 @@
-"""Unified entry point for the local project."""
+"""统一命令入口；按命令延迟加载对应界面或脚本，避免无关模型阻塞启动。"""
 
 import argparse
 from importlib import import_module
@@ -7,15 +7,11 @@ import sys
 
 COMMANDS = {
     "integrate": ("apps.integration_app", "Open the three-stage integration workbench"),
-    "video": ("apps.pose_app", "Open the video analysis application"),
+    "gate": ("apps.gate_app", "Open the gate capture workbench"),
+    "reid": ("apps.reid_app", "Open the re-identification workbench"),
     "binding": ("apps.binding_app", "Open the passenger-to-tray workbench"),
     "simulate": ("binding.generate_binding_simulation", "Generate simulated messages"),
     "replay": ("binding.replay_binding", "Replay and evaluate binding messages"),
-    "label": ("training.label_video_clips", "Label video clips"),
-    "extract": ("training.extract_clip_pose_features", "Extract clip pose features"),
-    "train": ("training.train_clip_classifier", "Train the clip classifier"),
-    "offline": ("apps.run_put_luggage_offline", "Analyze a video offline"),
-    "demo": ("apps.demo", "Run the pose estimation demo"),
 }
 
 

@@ -1,1 +1,1 @@
-"""Single-window integration of gate capture, Re-ID and tray binding."""
+"""闸机抓拍、重识别和行李框绑定的联合调度。"""

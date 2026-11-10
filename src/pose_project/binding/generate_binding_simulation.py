@@ -1,4 +1,4 @@
-"""Generate offline MQTT-shaped input logs and independent binding labels."""
+"""生成离线位置、RFID 消息和独立评估标签；模拟数据不代表现场准确率。"""
 
 import argparse
 from datetime import datetime, timedelta
@@ -204,7 +204,7 @@ def generate_dataset(config):
             "received_at_ms": received_at,
             "payload": {"roi_id": event["roi_id"], "rfid": event["rfid"]},
         })
-        # Labels come from the authored scenario, never from a candidate heuristic.
+        # 评估标签直接取自人工编排的场景，与算法候选结果保持独立。
         expected.append({
             "roi_id": event["roi_id"],
             "rfid": event["rfid"],

@@ -22,3 +22,8 @@ source_config.json
 *.egg-info/
 dist/
 .pytest_cache/
+archive/
+configs/*.bak
+configs/*.tmp
+*.pt
+*.pth

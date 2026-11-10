@@ -1,6 +1,7 @@
 """Focused regression coverage for the combined workbench and message path."""
 
 from copy import deepcopy
+from importlib import import_module
 from datetime import datetime
 import json
 import os
@@ -24,13 +25,13 @@ from pose_project.apps.integration_app import (
     IntegrationWindow, configure_application,
 )
 from pose_project.integration.configuration import (
-    defaults, load_settings, save_settings, validate,
+    active_binding, defaults, load_settings, save_settings, validate,
 )
 from pose_project.integration.controller import IntegrationController, message_preview
 from pose_project.integration.widgets import VideoCanvas
 from pose_project.integration.workers import (
     GateWorker, PreviewWorker, RecognitionWorker, StreamCapture, encode_image,
-    legacy_module, unique_detections,
+    unique_detections,
 )
 
 
@@ -79,6 +80,19 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(1, len(list(path.parent.glob(path.name + ".*.bak"))))
         self.assertEqual(loaded, json.loads(path.read_bytes().decode("utf-8", errors="strict")))
 
+    def test_old_two_region_config_loads_as_one_region(self):
+        path = Path(self.temp.name) / "旧配置.json"
+        legacy = deepcopy(self.settings)
+        legacy["binding"]["regions"]["A"]["operation_roi_xyxy"] = [300, 250, 500, 500]
+        path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+        loaded = load_settings(path)
+        self.assertEqual([0, 0, 960, 1080],
+                         loaded["binding"]["regions"]["A"]["roi_xyxy"])
+        self.assertNotIn("operation_roi_xyxy", loaded["binding"]["regions"]["A"])
+        save_settings(loaded, path)
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("operation_roi_xyxy", saved["binding"]["regions"]["A"])
+
     def test_relative_config_paths_resolve_against_config_directory(self):
         path = Path(self.temp.name) / "configs" / "integration.json"
         self.settings["output_dir"] = "../result"
@@ -122,6 +136,159 @@ class IntegrationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "请选择"):
             validate(self.settings, sources=True)
 
+    def region_window(self):
+        window = IntegrationWindow(self.settings, Path(self.temp.name) / "regions.json")
+        self.windows.append(window)
+        window._preview_frame("reid", np.zeros((1080, 1920, 3), dtype=np.uint8))
+        window._preview_frame("gate", np.zeros((1080, 1920, 3), dtype=np.uint8))
+        return window
+
+    def test_station_uses_one_region_for_recognition_and_binding(self):
+        window = self.region_window()
+        window._rectangle("A.roi_xyxy", [600, 100, 950, 900])
+        validate(window.collect())
+        self.assertEqual([600, 100, 950, 900],
+                         window.settings["binding"]["regions"]["A"]["roi_xyxy"])
+        self.assertNotIn("operation_roi_xyxy", window.settings["binding"]["regions"]["A"])
+        binding = active_binding(window.collect())
+        self.assertEqual([600, 100, 950, 900],
+                         binding["regions"]["A"]["operation_roi_xyxy"])
+        self.assertEqual(["A"], [window.rfid_region.itemText(i)
+                                for i in range(window.rfid_region.count())])
+
+    def test_front_mode_is_saved_and_restored_per_region(self):
+        window = self.region_window()
+        window.region_front_modes["A"].setCurrentIndex(5)
+        self.assertEqual("area", window.collect()["binding"]["regions"]["A"]["front_mode"])
+        saved = load_settings(window.config_path)
+        self.assertEqual("area", saved["binding"]["regions"]["A"]["front_mode"])
+        reopened = IntegrationWindow(saved, window.config_path)
+        self.windows.append(reopened)
+        self.assertEqual("area", reopened.region_front_modes["A"].currentData())
+
+    def test_old_front_mode_defaults_and_explicit_off_survive_load(self):
+        path = Path(self.temp.name) / "queue.json"
+        del self.settings["binding"]["regions"]["A"]["front_mode"]
+        self.settings["binding"]["regions"]["B"]["front_mode"] = None
+        save_settings(self.settings, path)
+        loaded = load_settings(path)
+        self.assertEqual("bottom", loaded["binding"]["regions"]["A"]["front_mode"])
+        self.assertIsNone(loaded["binding"]["regions"]["B"]["front_mode"])
+        loaded["binding"]["regions"]["A"]["front_mode"] = "unknown"
+        with self.assertRaisesRegex(ValueError, "队首模式无效"):
+            validate(loaded)
+
+    def test_rectangle_edit_is_saved_before_reopening(self):
+        path = Path(self.temp.name) / "regions.json"
+        window = IntegrationWindow(self.settings, path)
+        self.windows.append(window)
+        window._preview_frame("reid", np.zeros((1080, 1920, 3), dtype=np.uint8))
+        with patch.object(window, "error"):
+            window._rectangle("A.roi_xyxy", [0, 0, 1920, 1080])
+        saved = load_settings(path)
+        self.assertEqual([0, 0, 1920, 1080],
+                         saved["binding"]["regions"]["A"]["roi_xyxy"])
+
+    def test_region_editor_has_no_operation_area(self):
+        window = self.region_window()
+        self.assertNotIn("A.operation_roi_xyxy", window.draw_buttons)
+        self.assertNotIn("A.operation_roi_xyxy", window.delete_buttons)
+        self.assertEqual(["A"], [window.rfid_region.itemText(i)
+                                 for i in range(window.rfid_region.count())])
+
+    def test_delete_station_and_gate_then_save_and_reopen_draft(self):
+        window = self.region_window()
+        window.delete_buttons["A.roi_xyxy"].click()
+        self.assertEqual({"front_mode": "bottom"}, window.settings["binding"]["regions"]["A"])
+        self.assertIsNone(window.canvases["reid"].target)
+        self.assertNotIn("A 区域", window.canvases["reid"].overlays)
+        window.delete_buttons["gate"].click()
+        self.assertIsNone(window.settings["gate"]["roi"])
+        self.assertEqual({}, window.canvases["gate"].overlays)
+        window.save_config()
+        reopened = load_settings(window.config_path)
+        self.assertEqual({"front_mode": "bottom"}, reopened["binding"]["regions"]["A"])
+        self.assertIsNone(reopened["gate"]["roi"])
+        another = IntegrationWindow(reopened, window.config_path)
+        self.windows.append(another)
+        another._preview_frame("reid", np.zeros((540, 960, 3), dtype=np.uint8))
+        self.assertEqual({"front_mode": "bottom"}, another.settings["binding"]["regions"]["A"])
+        window._rectangle("A.roi_xyxy", [0, 0, 960, 1080])
+        with self.assertRaisesRegex(ValueError, "缺少闸机抓拍区"):
+            validate(window.collect())
+        window._rectangle("gate", [100, 100, 1500, 900])
+        validate(window.collect())
+
+    def test_add_and_delete_whole_region_updates_runtime_and_rfid_choices(self):
+        window = self.region_window()
+        window.add_region_button.click()
+        self.assertIn("C", window.region_enabled)
+        self.assertTrue(window.region_enabled["C"].isChecked())
+        window._rectangle("C.roi_xyxy", [100, 100, 800, 900])
+        config = window.collect()
+        validate(config)
+        self.assertEqual(["A", "C"], [window.rfid_region.itemText(i)
+                                     for i in range(window.rfid_region.count())])
+        controller = window.controller
+        controller.start(config, start_workers=False)
+        self.controllers.append(controller)
+        self.assertEqual({"A", "C"}, set(controller.binder.history))
+        self.assertNotIn("B", controller.settings["binding"]["regions"])
+        with self.assertRaisesRegex(ValueError, "已配置的区域"):
+            controller.inject_rfid("B", "disabled")
+        controller.stop()
+        window.delete_buttons["C"].click()
+        self.assertNotIn("C", window.settings["binding"]["regions"])
+        self.assertNotIn("C", window.collect()["reid"]["enabled_regions"])
+        self.assertEqual(["A"], [window.rfid_region.itemText(i)
+                                for i in range(window.rfid_region.count())])
+        window.add_region_button.click()
+        self.assertEqual({}, window.settings["binding"]["regions"]["C"])
+
+    def test_disabled_invalid_region_is_editable_but_not_used_by_binder(self):
+        self.settings["binding"]["regions"]["B"]["roi_xyxy"] = [1500, 100, 1900, 900]
+        validate(self.settings)
+        controller = self.controller()
+        self.assertEqual({"A"}, set(controller.binder.history))
+        window = self.region_window()
+        self.assertIn("未启用", window.region_status["B"].text())
+        window.region_enabled["B"].setChecked(True)
+        validate(window.collect())
+        save_settings(window.collect(), window.config_path)
+        self.assertEqual(["A", "B"], load_settings(window.config_path)["reid"]["enabled_regions"])
+
+    def test_empty_region_draft_roundtrips_but_start_is_rejected_before_workers(self):
+        window = self.region_window()
+        for name in list(window.region_enabled):
+            window.delete_region(name)
+        window.save_config()
+        draft = load_settings(window.config_path)
+        self.assertEqual({}, draft["binding"]["regions"])
+        with self.assertRaisesRegex(ValueError, "至少新增并启用"):
+            window.controller.start(draft)
+        self.assertFalse(window.controller.running)
+        self.assertIsNone(window.controller.run_dir)
+        with patch.object(window, "error") as warning:
+            window.start_session()
+        self.assertIn("至少新增并启用", warning.call_args.args[0])
+        window.add_region()
+        self.assertEqual(["A"], list(window.region_enabled))
+        with self.assertRaisesRegex(ValueError, "A 区缺少区域"):
+            validate(window.collect())
+
+    def test_partial_drafts_still_validate_coordinates_and_binding_parameters(self):
+        self.settings["binding"]["regions"] = {"C": {}}
+        self.settings["reid"]["enabled_regions"] = ["C"]
+        self.settings["gate"]["roi"] = None
+        validate(self.settings, require_regions=False)
+        self.settings["binding"]["binding_parameters"]["min_dwell_ms"] = -1
+        with self.assertRaises(ValueError):
+            validate(self.settings, require_regions=False)
+        self.settings["binding"]["binding_parameters"]["min_dwell_ms"] = 5000
+        self.settings["binding"]["regions"]["C"]["roi_xyxy"] = [0, 0, float("nan"), 100]
+        with self.assertRaisesRegex(ValueError, "C 区坐标无效"):
+            validate(self.settings, require_regions=False)
+
     def test_both_sources_accept_rtsp_and_reject_malformed_urls(self):
         self.settings["gate"]["source"] = "rtsp://user:password@127.0.0.1:8554/gate"
         self.settings["reid"]["source"] = "RTSP://127.0.0.1:8554/tray"
@@ -164,7 +331,7 @@ class IntegrationTest(unittest.TestCase):
             wait_frame=Mock(return_value=(image, 9, 1234567)), failed=False,
             fps=25, _thread=SimpleNamespace(join=Mock()))
         module = SimpleNamespace(StreamGrabber=Mock(return_value=grabber))
-        with patch("pose_project.integration.workers.legacy_module", return_value=module):
+        with patch("pose_project.integration.workers.import_module", return_value=module):
             capture = StreamCapture("rtsp://127.0.0.1/gate")
         ok, received = capture.read()
         self.assertTrue(ok)
@@ -180,7 +347,7 @@ class IntegrationTest(unittest.TestCase):
     def test_stream_adapter_reports_failure_and_preview_releases_capture(self):
         grabber = SimpleNamespace(start=Mock(), interrupt=Mock(), stop=Mock(),
             wait_frame=Mock(return_value=(None, -1, 0)), failed=True, _thread=None)
-        with patch("pose_project.integration.workers.legacy_module",
+        with patch("pose_project.integration.workers.import_module",
                    return_value=SimpleNamespace(StreamGrabber=lambda *a, **k: grabber)):
             capture = StreamCapture("rtsp://127.0.0.1/bad")
         try:
@@ -200,7 +367,7 @@ class IntegrationTest(unittest.TestCase):
         capture.release.assert_called_once()
 
     def test_gate_stream_uses_received_clock_and_releases_on_detection_error(self):
-        gate = legacy_module("check_gate", "person_extractor.py")
+        gate = import_module("pose_project.gate.processor")
         image = np.zeros((16, 20, 3), dtype=np.uint8)
         captured_at = 1793671800123
         capture = SimpleNamespace(isOpened=lambda: True, get=lambda prop: 25 if prop == cv2.CAP_PROP_FPS else 0,
@@ -228,7 +395,7 @@ class IntegrationTest(unittest.TestCase):
         capture.release.assert_called_once()
 
     def test_gate_stream_does_not_parse_url_as_file_and_propagates_failure(self):
-        gate = legacy_module("check_gate", "person_extractor.py")
+        gate = import_module("pose_project.gate.processor")
         processor = gate.ProcessorThread(
             ["rtsp://127.0.0.1/gate"], self.settings["gate"]["roi"],
             self.settings["gate"]["opts"], self.temp.name, mqtt_enabled=False,
@@ -240,7 +407,7 @@ class IntegrationTest(unittest.TestCase):
                 processor._run()
 
     def test_two_streams_restore_environment_and_keep_separate_transports(self):
-        module = legacy_module("reid1026001", "main.py")
+        module = import_module("pose_project.video.stream_capture")
         observed = []
 
         def open_capture(source, backend, params):
@@ -264,7 +431,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertIn("rtsp_transport;udp", options["rtsp://127.0.0.1/tray"])
 
     def test_gate_payload_keeps_stable_id_and_old_positional_api(self):
-        gate = legacy_module("check_gate", "mqtt_publisher.py")
+        gate = import_module("pose_project.gate.mqtt_publisher")
         publisher = gate.MqttPublisher(enabled=False)
         image = np.zeros((80, 40, 3), dtype=np.uint8)
         payload = publisher.build_payload("P001", "2026-11-03 09:00:00.000", upper_img=image)
@@ -278,28 +445,32 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(1, publisher._client.publish.call_count)
 
     def test_gate_injected_publisher_does_not_open_mqtt(self):
-        gate = legacy_module("check_gate", "person_extractor.py")
+        gate = import_module("pose_project.gate.processor")
         injected = object()
         with patch.object(gate, "MqttPublisher", side_effect=RuntimeError("must not connect")):
             worker = gate.ProcessorThread([], self.settings["gate"]["roi"],
                 self.settings["gate"]["opts"], self.temp.name, publisher=injected)
         self.assertIs(injected, worker.mqtt)
 
-    def test_reid_gallery_uses_full_id_updates_in_place_and_rebuilds(self):
+    def test_reid_gallery_uses_full_id_updates_without_resetting_tracks(self):
         worker = RecognitionWorker(self.settings["reid"], self.settings["binding"]["regions"])
         image = np.zeros((80, 40, 3), dtype=np.uint8)
         worker.module = SimpleNamespace(
-            decode_base64_image=lambda value: image if value else None)
+            decode_base64_image=lambda value: image if value else None,
+            set_phase_threads=Mock(), EXT_THREADS=20)
         worker.extractor = SimpleNamespace(extract=lambda imgs, tta: np.ones((1, 4)))
         detector = SimpleNamespace(reset_tracker=Mock())
-        worker.matchers = {"A": SimpleNamespace(detector=detector)}
+        matcher = SimpleNamespace(detector=detector, update_gallery=Mock())
+        worker.matchers = {"A": matcher}
         payload = {"passenger_id": "stable-identity", "local_id": "P001",
                    "images": {"upper": "encoded"}}
         worker.add_person(payload)
         worker._drain_gallery()
         self.assertEqual(["stable-identity"], list(worker.gallery))
-        self.assertEqual({}, worker.matchers)
-        detector.reset_tracker.assert_called_once()
+        self.assertIs(matcher, worker.matchers["A"])
+        detector.reset_tracker.assert_not_called()
+        matcher.update_gallery.assert_called_once_with(
+            list(worker.gallery.values()), {"stable-identity": "P001"})
         worker.add_person(payload)
         worker._drain_gallery()
         self.assertEqual(1, len(worker.gallery))
@@ -413,7 +584,7 @@ class IntegrationTest(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual("local", window.collect()["transport"])
         self.assertEqual(2, len(window.canvases))
-        self.assertEqual(4, window.event_tabs.count())
+        self.assertEqual(7, window.event_tabs.count())
         self.assertFalse(window.stop_button.isEnabled())
         for size in ((1440, 940), (1000, 720)):
             window.resize(*size)
@@ -422,8 +593,8 @@ class IntegrationTest(unittest.TestCase):
             self.assertGreaterEqual(window.canvases["reid"].width(), 240)
         window._preview_frame("reid", np.zeros((540, 960, 3), dtype=np.uint8))
         self.assertEqual([960, 540], window.collect()["reid"]["image_size"])
-        self.assertEqual([150, 125, 250, 250],
-                         window.collect()["binding"]["regions"]["A"]["operation_roi_xyxy"])
+        self.assertEqual([0, 0, 480, 540],
+                         window.collect()["binding"]["regions"]["A"]["roi_xyxy"])
 
     def test_mqtt_uses_actual_broker_routes_for_person_position_and_rfid(self):
         from test_binding_app import LoopbackBroker
@@ -462,7 +633,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(1, controller.counts["unsent"])
 
     def test_stream_time_is_returned_atomically_with_frame(self):
-        module = legacy_module("reid1026001", "main.py")
+        module = import_module("pose_project.video.stream_capture")
         capture = module.StreamGrabber("rtsp://unused")
         capture._frame = np.zeros((16, 16, 3), dtype=np.uint8)
         capture._seq, capture._captured_at_ms = 5, 1234
@@ -471,7 +642,7 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(2, len(capture.wait_frame(-1)))
 
     def test_stream_capture_clock_can_share_the_receiver_time(self):
-        module = legacy_module("reid1026001", "main.py")
+        module = import_module("pose_project.video.stream_capture")
         image = np.zeros((16, 16, 3), dtype=np.uint8)
         grabber = module.StreamGrabber("rtsp://unused", clock=lambda: 1234)
 

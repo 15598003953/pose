@@ -1,4 +1,4 @@
-"""Qt session control and data adapters for the passenger/tray binder."""
+"""绑定会话与输入适配：统一文件、MQTT、HTTP 消息，再调用绑定算法。"""
 
 from collections import OrderedDict, deque
 from copy import deepcopy
@@ -33,6 +33,7 @@ def field_value(data, path):
 
 
 def normalize_message(topic, data, received, config, fields):
+    """按字段映射提取算法需要的内容，原消息中的额外字段不参与判定。"""
     if not isinstance(data, dict):
         raise ValueError("消息必须是 JSON 对象")
     payload = data.get("payload", data)
@@ -72,7 +73,7 @@ def validate_topic(topic):
 
 
 class LiveInbox:
-    """Stamp reception and take a timer watermark under the same lock."""
+    """用同一把锁记录收报时间和消息顺序，避免定时判定越过尚未处理的消息。"""
 
     def __init__(self, limit=10000):
         self.items = deque()
@@ -95,7 +96,7 @@ class LiveInbox:
     def drain(self, limit=500):
         with self.lock:
             items = [self.items.popleft() for _ in range(min(limit, len(self.items)))]
-            # A later callback can share this millisecond, so leave it uncommitted.
+            # 同一毫秒仍可能收到新消息，因此只推进到上一毫秒。
             watermark = self.now() - 1 if not self.items else None
             return items, watermark
 
@@ -171,7 +172,7 @@ class MqttLink(QObject):
                 self.received_packets.move_to_end(key)
                 if len(self.received_packets) > 4096:
                     self.received_packets.popitem(last=False)
-            # Stamp before decoding or scheduling any GUI work.
+            # 先记录接收时间，再解码并更新界面，避免处理耗时影响关联时序。
             self.inbox.put(message.topic, raw, bool(getattr(message, "retain", False)))
         except (ValueError, TypeError) as exc:
             self.error.emit(str(exc))
