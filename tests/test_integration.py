@@ -516,6 +516,58 @@ class IntegrationTest(unittest.TestCase):
         self.assertEqual(1, json.loads((run_dir / "summary.json").read_text())["bound"])
         self.assertTrue((run_dir / "decisions.jsonl").read_text(encoding="utf-8").strip())
 
+    def test_field_test_session_records_metadata_events_and_summary(self):
+        settings = deepcopy(self.settings)
+        settings["debug"] = {
+            "enabled": False,
+            "field_test": {
+                "enabled": True,
+                "test_id": "FT-001",
+                "operator": "tester",
+                "site": "gate-A",
+                "scenario": "single passenger",
+                "notes": "field check",
+            },
+        }
+        controller = IntegrationController()
+        self.controllers.append(controller)
+        controller.start(settings, start_workers=False)
+        now = controller.inbox.now()
+        controller._accept(
+            settings["mqtt"]["person_topic"],
+            {"passenger_id": "passenger-1", "local_id": "P001"},
+            now,
+        )
+        controller._record_decisions([{
+            "roi_id": "A", "rfid": "TRAY-1", "status": "bound",
+            "reason": "unique_candidate", "passenger_id": "passenger-1",
+            "binding": {"roi_id": "A", "rfid": "TRAY-1",
+                        "passenger_id": "passenger-1"},
+            "candidates": [],
+        }])
+        controller.record_field_observation(
+            "binding", "pass", "绑定 passenger-1",
+            "绑定 passenger-1", "现场记录", {"selected_passenger_id": "passenger-1"})
+        run_dir = controller.run_dir
+        controller.stop()
+
+        metadata = json.loads((run_dir / "field_test.json").read_text(encoding="utf-8"))
+        events = [
+            json.loads(line) for line in
+            (run_dir / "field_test_events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual("finished", metadata["status"])
+        self.assertEqual("FT-001", metadata["test"]["test_id"])
+        self.assertTrue(metadata["duration_ms"] >= 0)
+        self.assertEqual({
+            "session_started", "person_collected", "binding_decision",
+            "manual_observation", "session_stopped",
+        }, {event["event_type"] for event in events})
+        self.assertEqual(1, summary["field_test"]["manual_observations"])
+        self.assertEqual(1, summary["field_test"]["event_counts"]["binding_decision"])
+        self.assertTrue((run_dir / "performance.jsonl").is_file())
+
     def test_stale_positions_never_gain_dwell_when_repeated(self):
         controller = self.controller()
         controller.timer.stop()
@@ -584,7 +636,7 @@ class IntegrationTest(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual("local", window.collect()["transport"])
         self.assertEqual(2, len(window.canvases))
-        self.assertEqual(7, window.event_tabs.count())
+        self.assertEqual(8, window.event_tabs.count())
         self.assertFalse(window.stop_button.isEnabled())
         for size in ((1440, 940), (1000, 720)):
             window.resize(*size)

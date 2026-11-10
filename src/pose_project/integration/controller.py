@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import datetime
 import json
 import logging
+import platform
 from pathlib import Path
 import re
 import sys
@@ -34,6 +35,14 @@ def message_preview(payload):
             for key, value in preview["images"].items()
         }
     return preview
+
+
+def _timestamp_text(timestamp_ms):
+    return datetime.fromtimestamp(timestamp_ms / 1000).astimezone().isoformat()
+
+
+def _redact_source(source):
+    return re.sub(r"(rtsps?://)[^/@\s]+:[^/@\s]+@", r"\1***@", str(source or ""))
 
 
 class IntegrationController(QObject):
@@ -74,6 +83,9 @@ class IntegrationController(QObject):
         self._next_debug = 0.0
         self._position_ages = {}
         self.debug_enabled = False
+        self.field_test_enabled = False
+        self._field_test_meta = None
+        self._field_test_counts = Counter()
 
     def _store_frame(self, stage, image):
         # 每路只保留最新画面，后台推理较慢时也不积压界面事件。
@@ -115,6 +127,8 @@ class IntegrationController(QObject):
         with self.inbox.lock:
             metrics["message_pending"] = len(self.inbox.items)
         metrics["position_age_ms"] = dict(self._position_ages)
+        self._record_field_event("recognition", {
+            key: value for key, value in report.items() if key != "_frame"})
         self.recognition.emit(report)
         now = time.monotonic()
         if self.debug_enabled and now >= self._next_debug:
@@ -137,6 +151,45 @@ class IntegrationController(QObject):
         self.logger.info(line)
         self.log.emit(line)
 
+    def _write_field_test_meta(self):
+        if not self.field_test_enabled or self._field_test_meta is None:
+            return
+        (self.run_dir / "field_test.json").write_text(
+            json.dumps(self._field_test_meta, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+
+    def _record_field_event(self, event_type, data=None):
+        handle = self._handles.get("field_test")
+        if handle is None:
+            return
+        record = {
+            "event_type": event_type,
+            "recorded_at_ms": self.inbox.now(),
+            "data": data or {},
+        }
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        self._field_test_counts[event_type] += 1
+
+    def record_field_observation(self, category, result, expected, actual, note,
+                                 context=None):
+        if not self.running or not self.field_test_enabled:
+            raise ValueError("请先启用现场测试记录并启动联调")
+        values = {
+            "category": str(category).strip(),
+            "result": str(result).strip(),
+            "expected": str(expected).strip(),
+            "actual": str(actual).strip(),
+            "note": str(note).strip(),
+            "context": context or {},
+        }
+        if not values["category"] or not values["result"]:
+            raise ValueError("现场记录类别和结论不能为空")
+        self._record_field_event("manual_observation", values)
+        self.write_log("[现场记录] {} / {}".format(
+            values["category"], values["result"]))
+        return values
+
     def start(self, settings, start_workers=True):
         # 每次启动新建会话目录和算法状态，避免沿用上次的旅客与轨迹。
         if self.running or self.stopping:
@@ -155,6 +208,49 @@ class IntegrationController(QObject):
         }
         self.binder = PassengerTrayBinder(self.settings["binding"])
         self.inbox = LiveInbox()
+        field_test = self.settings.get("debug", {}).get("field_test", {})
+        self.field_test_enabled = bool(field_test.get("enabled", False))
+        self._field_test_counts.clear()
+        self._field_test_meta = None
+        if self.field_test_enabled:
+            self._handles["field_test"] = (
+                self.run_dir / "field_test_events.jsonl").open("a", encoding="utf-8")
+            started_at_ms = self.inbox.now()
+            self._field_test_meta = {
+                "schema_version": 1,
+                "status": "running",
+                "session_id": self.run_dir.name,
+                "started_at_ms": started_at_ms,
+                "started_at": _timestamp_text(started_at_ms),
+                "test": {
+                    key: str(field_test.get(key, "")).strip()
+                    for key in ("test_id", "operator", "site", "scenario", "notes")
+                },
+                "runtime": {
+                    "packaged": bool(getattr(sys, "frozen", False)),
+                    "python": platform.python_version(),
+                    "platform": platform.platform(),
+                },
+                "configuration": {
+                    "transport": self.settings["transport"],
+                    "gate_source": _redact_source(self.settings["gate"]["source"]),
+                    "reid_source": _redact_source(self.settings["reid"]["source"]),
+                    "enabled_regions": list(self.settings["reid"]["enabled_regions"]),
+                    "threshold": self.settings["reid"]["threshold"],
+                    "sample_interval_ms": self.settings["reid"]["sample_interval_ms"],
+                    "image_size": list(self.settings["reid"]["image_size"]),
+                },
+                "files": [
+                    "field_test.json", "field_test_events.jsonl",
+                    "settings.json", "runtime.log", "messages.jsonl",
+                    "decisions.jsonl", "summary.json",
+                ],
+            }
+            self._write_field_test_meta()
+            self._record_field_event("session_started", {
+                "run_dir": str(self.run_dir),
+                "configuration": self._field_test_meta["configuration"],
+            })
         self.seen_events = {}
         self.records.clear()
         self.counts.clear()
@@ -168,7 +264,9 @@ class IntegrationController(QObject):
         self._next_preview = self._next_debug = 0.0
         self.running = True
         self.stopping = False
-        self.set_debug(settings.get("debug", {}).get("enabled", False))
+        self.set_debug(
+            settings.get("debug", {}).get("enabled", False) or
+            self.field_test_enabled)
         self.running_changed.emit(True)
         try:
             if settings["transport"] == "mqtt":
@@ -222,6 +320,8 @@ class IntegrationController(QObject):
             self.bridge.connected = connected
         self.state.emit("transport", text)
         self.write_log("[MQTT] " + text)
+        self._record_field_event("mqtt_state", {
+            "connected": bool(connected), "text": text})
 
     def _delivery(self, index, status):
         if status in ("已确认", "未确认"):
@@ -297,6 +397,11 @@ class IntegrationController(QObject):
             if worker is not None and worker.isRunning():
                 worker.add_person(payload)
             self.counts["persons"] += 1
+            self._record_field_event("person_collected", {
+                key: payload.get(key) for key in (
+                    "passenger_id", "person_id", "local_id",
+                    "capture_time", "source_video")
+            })
             return
         if topic == self.settings["binding"]["topics"]["rfid"]:
             if retained:
@@ -326,6 +431,7 @@ class IntegrationController(QObject):
             self._handles["decisions"].write(json.dumps(result, ensure_ascii=False) + "\n")
             self._handles["decisions"].flush()
             self.counts[result["status"]] += 1
+            self._record_field_event("binding_decision", result)
             self.decision.emit(result)
             self.write_log("[绑定] {} {} {}".format(
                 result["rfid"], result["status"], result["passenger_id"] or result["reason"]))
@@ -380,6 +486,7 @@ class IntegrationController(QObject):
         self.state.emit(name, "错误")
         self.write_log("[{}] {}".format(name, text))
         self.counts[name + "_errors"] += 1
+        self._record_field_event("worker_error", {"worker": name, "text": text})
 
     def _worker_finished(self, name):
         if not self.counts[name + "_errors"]:
@@ -407,9 +514,28 @@ class IntegrationController(QObject):
             self.bridge.close()
             self.bridge.deleteLater()
             self.bridge = None
+        self._record_field_event("session_stopped", {"counts": dict(self.counts)})
         self.write_log("会话已结束：" + json.dumps(dict(self.counts), ensure_ascii=False))
+        summary = dict(self.counts)
+        if self.field_test_enabled:
+            summary["field_test"] = {
+                "manual_observations": self._field_test_counts["manual_observation"],
+                "recognition_records": self._field_test_counts["recognition"],
+                "event_counts": dict(self._field_test_counts),
+            }
         (self.run_dir / "summary.json").write_text(
-            json.dumps(dict(self.counts), ensure_ascii=False, indent=2), encoding="utf-8")
+            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        if self.field_test_enabled:
+            ended_at_ms = self.inbox.now()
+            self._field_test_meta.update({
+                "status": "finished",
+                "ended_at_ms": ended_at_ms,
+                "ended_at": _timestamp_text(ended_at_ms),
+                "duration_ms": ended_at_ms - self._field_test_meta["started_at_ms"],
+                "counts": dict(self.counts),
+                "event_counts": dict(self._field_test_counts),
+            })
+            self._write_field_test_meta()
         for handle in self._handles.values():
             handle.close()
         self._handles.clear()
@@ -419,6 +545,7 @@ class IntegrationController(QObject):
             worker.deleteLater()
         self.workers.clear()
         self.running = self.stopping = False
+        self.field_test_enabled = False
         self.state.emit("binding", "已停止")
         self.running_changed.emit(False)
         self.stopped.emit()

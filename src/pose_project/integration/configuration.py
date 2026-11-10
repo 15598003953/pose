@@ -24,6 +24,10 @@ REID_RUNTIME_DEFAULTS = {
     "sample_interval_ms": 200, "detector_image_size": 960,
     "preview_fps": 15, "flip_tta": True,
 }
+FIELD_TEST_DEFAULTS = {
+    "enabled": False, "test_id": "", "operator": "", "site": "",
+    "scenario": "", "notes": "",
+}
 FRONT_MODE_VALUES = (None, "bottom", "top", "left", "right", "area")
 FRONT_MODE_ITEMS = ("队首:关", "队首:下", "队首:上", "队首:左",
                     "队首:右", "队首:最大")
@@ -79,6 +83,10 @@ def defaults():
             "host": "127.0.0.1", "port": 1883, "username": "", "tls": False,
             "person_topic": "check_gate/person/collected",
             "output_topic": "pose/bindings", "output_enabled": False,
+        },
+        "debug": {
+            "enabled": False,
+            "field_test": dict(FIELD_TEST_DEFAULTS),
         },
         "output_dir": str(RESULT_DIR / "integration"),
     }
@@ -136,8 +144,19 @@ def validate(settings, sources=False, *, require_regions=True):
         raise ValueError("检测输入尺寸必须是 32 的倍数")
     if type(reid.get("flip_tta", True)) is not bool:
         raise ValueError("翻转增强必须为开关值")
-    if type(settings.get("debug", {}).get("enabled", False)) is not bool:
+    debug = settings.get("debug", {})
+    if not isinstance(debug, dict):
+        raise ValueError("调试配置必须为对象")
+    if type(debug.get("enabled", False)) is not bool:
         raise ValueError("性能日志必须为开关值")
+    field_test = debug.get("field_test", {})
+    if not isinstance(field_test, dict):
+        raise ValueError("现场测试记录配置必须为对象")
+    if type(field_test.get("enabled", False)) is not bool:
+        raise ValueError("现场测试记录必须为开关值")
+    for key in ("test_id", "operator", "site", "scenario", "notes"):
+        if not isinstance(field_test.get(key, ""), str):
+            raise ValueError("现场测试记录的{}必须为文字".format(key))
     regions = settings["binding"]["regions"]
     if not isinstance(regions, dict):
         raise ValueError("供框台区域配置必须为对象")
@@ -189,6 +208,11 @@ def validate(settings, sources=False, *, require_regions=True):
 def load_settings(path=DEFAULT_CONFIG):
     path = Path(path)
     settings = read_json(path) if path.exists() else defaults()
+    settings.setdefault("debug", {})
+    settings["debug"].setdefault("enabled", False)
+    field_test = settings["debug"].setdefault("field_test", {})
+    for key, value in FIELD_TEST_DEFAULTS.items():
+        field_test.setdefault(key, value)
     for geometry in settings["binding"]["regions"].values():
         if geometry.get("roi_xyxy") is None and geometry.get("operation_roi_xyxy") is not None:
             geometry["roi_xyxy"] = geometry["operation_roi_xyxy"]

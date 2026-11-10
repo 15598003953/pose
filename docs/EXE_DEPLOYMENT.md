@@ -58,6 +58,9 @@ RTSP 地址中的摄像头账号密码会保存在配置中。
 
 “性能调试”显示实际推理设备、识别帧率、各阶段耗时、位置延迟和等待数量。
 勾选“记录性能日志”后，会话目录生成 `performance.jsonl`，每秒至多追加一条。
+“现场测试”页可以填写测试编号、地点、场景和人工核对结论。启用后会话目录生成
+`field_test.json` 和 `field_test_events.jsonl`，记录每帧识别结果、绑定判定、
+MQTT 状态、后台错误和人工观察。启用现场测试记录会自动记录性能日志。
 “算法”页可设置识别间隔、检测输入尺寸、预览帧率及翻转增强。
 默认 200 ms、960、15 fps、翻转增强开启。修改计算参数后需复核现场识别效果。
 位置有效期和绑定规则保持原值，超时结果不会通过修改时间戳变成新位置。
@@ -104,6 +107,8 @@ _internal/                    Python、Qt、Torch、OpenCV、模型等运行文�
 configs/                      可编辑的配置
 runtime/                      库缓存，运行时生成
 result/integration/           每次会话的日志、图片和绑定结果
+field_test.json               现场测试元数据和会话汇总
+field_test_events.jsonl       现场测试结构化事件
 start_server.cmd              终端启动入口
 check_environment.cmd         环境及模型检查入口
 build_info.json               构建环境和依赖版本
