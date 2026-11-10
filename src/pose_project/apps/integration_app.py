@@ -698,6 +698,7 @@ class IntegrationWindow(QMainWindow):
         statuses = {"matched": "已匹配", "below_threshold": "未达阈值",
                     "warming_track": "轨迹确认中", "no_gallery": "等待旅客入库",
                     "waiting_track": "等待稳定轨迹",
+                    "ambiguous_match": "候选接近，暂不锁定",
                     "passenger_locked": "旅客已完成匹配，不再分配",
                     "duplicate": "身份重复，未采用"}
         self.recognition_table.setUpdatesEnabled(False)
@@ -972,6 +973,7 @@ class IntegrationWindow(QMainWindow):
             "matched": "已匹配",
             "below_threshold": "未达阈值",
             "warming_track": "轨迹确认中",
+            "ambiguous_match": "候选接近，暂不锁定",
             "duplicate": "身份重复，未采用",
         }
         binding_statuses = {"bound": "已绑定", "unbound": "未绑定",

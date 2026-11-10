@@ -30,6 +30,7 @@ class TrackMatcher:
     FEAT_REFRESH = 10  # 同一轨迹每 10 帧刷新一次外观特征
     LEADER_MISS_LIMIT = 8
     LEADER_MARGIN = 0.08
+    IDENTITY_MARGIN = 0.05
 
     def __init__(self, persons, detector, extractor, threshold,
                  display_labels=None, front_mode=None, passenger_locks=None):
@@ -80,6 +81,7 @@ class TrackMatcher:
         label_indices = {label: index for index, label in enumerate(label_names)}
         for tid, state in self.tracks.items():
             state["hist"].clear()
+            state["votes"].clear()
             state["label_index"] = label_indices.get(locked_labels.get(tid))
         self.last_detections = []
         self.last_candidates = []
@@ -110,6 +112,13 @@ class TrackMatcher:
         return candidate - current >= margin
 
     def _select_leader(self, boxes, valid_indices, tids, shape):
+        def keep_locked(indices):
+            locked = [
+                index for index, tid in enumerate(tids)
+                if (self.tracks.get(tid) or {}).get("label_index") is not None
+            ]
+            return sorted(set(indices) | set(locked))
+
         if not valid_indices:
             if self._leader_tid is not None:
                 self._leader_miss += 1
@@ -124,7 +133,7 @@ class TrackMatcher:
         if self._leader_tid is None:
             self._leader_tid = tids[best]
             self._leader_miss = 0
-            return [best]
+            return keep_locked([best])
 
         try:
             current = tids.index(self._leader_tid)
@@ -135,14 +144,14 @@ class TrackMatcher:
             if self._leader_miss >= self.LEADER_MISS_LIMIT:
                 self._leader_tid = tids[best]
                 self._leader_miss = 0
-                return [best]
-            return []
+                return keep_locked([best])
+            return keep_locked([])
 
         self._leader_miss = 0
         if best != current and self._leader_better(scores[best], scores[current], shape):
             self._leader_tid = tids[best]
-            return [best]
-        return [current]
+            return keep_locked([best])
+        return keep_locked([current])
 
     def _extract_feats(self, crops, tids, tta=True):
         if not crops:
@@ -214,17 +223,26 @@ class TrackMatcher:
         # 每个检测框对每个标签的相似度（同标签多张图取最大），
         # 并写入轨迹历史，用 top-k 平滑后的轨迹得分做最终判定，
         # 避免逐帧匹配抖动与偶发误配（如外观相似的路人）。
-        lab_sims = None
+        lab_sims = [None] * len(crops)
         extracted_at = detected_at
-        if crops:
+        unlocked_indices = [
+            index for index, tid in enumerate(valid_tids)
+            if (self.tracks.get(tid) or {}).get("label_index") is None
+        ]
+        if unlocked_indices:
             set_phase_threads(EXT_THREADS)
-            feats = self._extract_feats(crops, valid_tids, tta=tta)
+            feats = self._extract_feats(
+                [crops[index] for index in unlocked_indices],
+                [valid_tids[index] for index in unlocked_indices],
+                tta=tta)
             extracted_at = time.perf_counter()
             s = feats @ self.gallery_all.T                    # (N, F)
-            lab_sims = np.zeros((len(crops), self.n_labels))
+            unlocked_sims = np.zeros((len(unlocked_indices), self.n_labels))
             for li, cols in enumerate(self.label_cols):
-                lab_sims[:, li] = s[:, cols].max(axis=1)
-            for j, tid in enumerate(valid_tids):
+                unlocked_sims[:, li] = s[:, cols].max(axis=1)
+            for local_index, crop_index in enumerate(unlocked_indices):
+                lab_sims[crop_index] = unlocked_sims[local_index]
+                tid = valid_tids[crop_index]
                 if tid is None:
                     continue
                 st = self.tracks.get(tid)
@@ -233,9 +251,11 @@ class TrackMatcher:
                         "hist": deque(maxlen=self.TRACK_HIST),
                         "seen": self.idx,
                         "label_index": None,
+                        "votes": deque(maxlen=self.MIN_FRAMES),
                         "token": object(),
                     }
-                st["hist"].append(lab_sims[j])
+                st["hist"].append(unlocked_sims[local_index])
+                st["votes"].append(int(unlocked_sims[local_index].argmax()))
                 st["seen"] = self.idx
         candidates = []
         for j, i in enumerate(valid_idx):
@@ -243,30 +263,68 @@ class TrackMatcher:
             x1, y1, x2, y2 = x1 + ox, y1 + oy, x2 + ox, y2 + oy
             tid = valid_tids[j]
             st = self.tracks.get(tid) if tid is not None else None
-            if st is not None and len(st["hist"]) > 0:
+            locked_index = st.get("label_index") if st is not None else None
+            if locked_index is not None:
+                label_index = locked_index
+                sim = float(st.get("confirmed_score", self.threshold))
+                second_score = None
+                margin = None
+                stable = True
+                status = "matched"
+            elif st is not None and len(st["hist"]) > 0:
                 h = np.stack(st["hist"])                      # (T, L)
                 k = min(self.TRACK_TOPK, len(h))
                 vec = np.sort(h, axis=0)[-k:].mean(axis=0)    # (L,) 轨迹得分
                 mature = len(h) >= self.MIN_FRAMES
+                ranked_index = int(vec.argmax())
+                second_score = (
+                    float(np.partition(vec, -2)[-2])
+                    if self.n_labels > 1 else None)
+                label_index = ranked_index
+                sim = float(vec[label_index])
+                margin = (sim - second_score
+                          if second_score is not None else None)
+                votes = list(st.get("votes", ()))
+                stable = (
+                    len(votes) >= self.MIN_FRAMES
+                    and len(set(votes[-self.MIN_FRAMES:])) == 1
+                    and votes[-1] == label_index)
+                status = ("below_threshold" if sim < self.threshold else
+                          "warming_track" if not mature or not stable else
+                          "ambiguous_match"
+                          if margin is not None and margin < self.IDENTITY_MARGIN
+                          else "matched")
             else:
-                vec = lab_sims[j] if lab_sims is not None else np.zeros(self.n_labels)
+                vec = lab_sims[j] if lab_sims[j] is not None else np.zeros(self.n_labels)
                 mature = True
-            ranked_index = int(vec.argmax())
-            locked_index = st.get("label_index") if st is not None else None
-            label_index = ranked_index if locked_index is None else locked_index
-            sim = float(vec[label_index])
+                ranked_index = int(vec.argmax())
+                second_score = (
+                    float(np.partition(vec, -2)[-2])
+                    if self.n_labels > 1 else None)
+                label_index = ranked_index
+                sim = float(vec[label_index])
+                margin = (sim - second_score
+                          if second_score is not None else None)
+                stable = False
+                status = ("below_threshold" if sim < self.threshold else
+                          "waiting_track")
             label = self.label_names[label_index]
-            status = ("below_threshold" if sim < self.threshold else
-                      "waiting_track" if st is None else
-                      "warming_track" if not mature else "matched")
             owner = self.passenger_locks.get(label)
             if owner is not None and (st is None or owner is not st["token"]):
                 status = "passenger_locked"
             candidates.append({"label": label, "score": round(sim, 4),
+                               "second_score": (
+                                   round(second_score, 4)
+                                   if second_score is not None else None),
+                               "match_margin": (
+                                   round(margin, 4)
+                                   if margin is not None else None),
                                "detector_score": round(float(confs[i]), 4),
                                "bbox_xyxy": [x1, y1, x2, y2], "tid": tid,
                                "status": status,
-                               "identity_locked": locked_index is not None})
+                               "identity_locked": locked_index is not None,
+                               "identity_frozen": locked_index is not None,
+                               "stable_candidate": stable})
         self.last_candidates = candidates
         self.last_detections = []
         if not defer_confirmation:
@@ -284,11 +342,27 @@ class TrackMatcher:
     @staticmethod
     def confirm_frame(matchers, canvas):
         """整帧所有区域完成候选计算后，确认唯一对象并锁定旅客。"""
-        counts = Counter(c["label"] for m in matchers for c in m.last_candidates
-                         if c["status"] == "matched")
+        counts = Counter(
+            c["label"] for m in matchers for c in m.last_candidates
+            if c["status"] == "matched" and not c.get("identity_locked"))
         for matcher in matchers:
             matcher.last_detections = []
             for candidate in matcher.last_candidates:
+                if candidate.get("identity_locked"):
+                    state = matcher.tracks.get(candidate["tid"])
+                    if state is None:
+                        continue
+                    matcher.last_detections.append({
+                        key: candidate[key]
+                        for key in ("label", "score", "bbox_xyxy", "tid")})
+                    x1, y1, x2, y2 = candidate["bbox_xyxy"]
+                    color = (0, 255, 0)
+                    cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 4)
+                    shown = matcher.display_labels.get(
+                        candidate["label"], candidate["label"])
+                    draw_text(canvas, f"{shown} {candidate['score']:.2f}",
+                              (x1, max(0, y1 - 12)), color, 0.8, 2)
+                    continue
                 if candidate["status"] != "matched":
                     continue
                 label, tid = candidate["label"], candidate["tid"]
@@ -303,7 +377,9 @@ class TrackMatcher:
                 # 会话级记录独立于轨迹缓存，轨迹过期或编号复用都不会解锁。
                 matcher.passenger_locks[label] = state["token"]
                 state["label_index"] = matcher.label_names.index(label)
+                state["confirmed_score"] = candidate["score"]
                 candidate["identity_locked"] = True
+                candidate["identity_frozen"] = True
                 matcher.last_detections.append({
                     key: candidate[key] for key in ("label", "score", "bbox_xyxy", "tid")})
                 x1, y1, x2, y2 = candidate["bbox_xyxy"]

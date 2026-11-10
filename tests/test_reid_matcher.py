@@ -82,13 +82,50 @@ class TrackMatcherTest(unittest.TestCase):
 
         self.assertEqual(["gate-person"] * len(frames), labels)
         self.assertEqual("gate-person", matcher.last_detections[0]["label"])
-        self.assertEqual(len(frames), matcher.extractor.calls)
+        self.assertEqual(3, matcher.extractor.calls)
+
+    def test_locked_track_keeps_position_without_reextracting_or_rematching(self):
+        box_a = [[10, 10, 50, 90]]
+        box_b = [[20, 12, 60, 92]]
+        matcher = TrackMatcher(
+            [{"label": "person", "feature": np.array([1.0, 0.0])}],
+            _ScriptDetector([(box_a, [7])] * 3 + [(box_b, [7])]),
+            _ConstantExtractor(), threshold=0.65)
+        frame = np.zeros((120, 80, 3), dtype=np.uint8)
+
+        for _ in range(3):
+            matcher.annotate(frame)
+        calls = matcher.extractor.calls
+        self.assertTrue(matcher.last_candidates[0]["identity_locked"])
+
+        matcher.annotate(frame)
+        self.assertEqual(calls, matcher.extractor.calls)
+        self.assertEqual([20, 12, 60, 92],
+                         matcher.last_detections[0]["bbox_xyxy"])
+        self.assertTrue(matcher.last_candidates[0]["identity_frozen"])
+        self.assertEqual("matched", matcher.last_candidates[0]["status"])
+
+    def test_close_second_candidate_does_not_lock_identity(self):
+        matcher = TrackMatcher(
+            [{"label": "person", "feature": np.array([1.0, 0.0])},
+             {"label": "similar", "feature": np.array([.99, .1])}],
+            _Detector(), _ConstantExtractor(), threshold=0.65)
+        frame = np.zeros((120, 80, 3), dtype=np.uint8)
+
+        for _ in range(3):
+            matcher.annotate(frame)
+        self.assertEqual({}, matcher.passenger_locks)
+        self.assertEqual("ambiguous_match", matcher.last_candidates[0]["status"])
+        self.assertLess(matcher.last_candidates[0]["match_margin"],
+                        matcher.IDENTITY_MARGIN)
 
     def test_track_feature_cache_refreshes_every_ten_frames(self):
         extractor = _Extractor([[1.0, 0.0], [1.0, 0.0]])
         matcher = TrackMatcher(
             [{"label": "person", "feature": np.array([1.0, 0.0])}],
             _Detector(), extractor, threshold=0.65)
+        matcher.MIN_FRAMES = 100
+        matcher.TRACK_HIST = 200
         frame = np.zeros((120, 80, 3), dtype=np.uint8)
 
         for _ in range(10):
