@@ -109,6 +109,34 @@ class LiveEvidenceTest(unittest.TestCase):
         finally:
             window.close()
 
+    def test_rejected_candidate_does_not_replace_confirmed_passenger_evidence(self):
+        window = IntegrationWindow(defaults())
+        try:
+            original = np.zeros((30, 30, 3), dtype=np.uint8)
+            candidate = {
+                "label": "passenger-1", "score": .9, "tid": 7,
+                "bbox_xyxy": [1, 2, 10, 18], "status": "matched",
+                "identity_locked": True}
+            report = {
+                "captured_at_ms": 1000, "completed_at_ms": 1050,
+                "_frame": original, "metrics": {},
+                "regions": {"A": {"candidates": [candidate], "detections": []}}}
+            window._recognition(report)
+            for status in ("below_threshold", "ambiguous_match", "warming_track"):
+                with self.subTest(status=status):
+                    report["_frame"] = np.full_like(original, 255)
+                    report["regions"] = {
+                        "B": {"candidates": [dict(candidate, tid=8, status=status,
+                                                  identity_locked=False)],
+                              "detections": []}}
+                    window._recognition(report)
+                    evidence = window._evidence["passenger-1"]["recognition"]
+                    self.assertEqual(7, evidence["tid"])
+                    self.assertIs(original, evidence["frame"])
+                    self.assertIn("未确认", window.recognition_table.item(0, 2).text())
+        finally:
+            window.close()
+
 
 if __name__ == "__main__":
     unittest.main()

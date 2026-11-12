@@ -533,11 +533,44 @@ class IntegrationTest(unittest.TestCase):
         self.controllers.append(controller)
         controller.start(settings, start_workers=False)
         now = controller.inbox.now()
+        sample_image = np.full((40, 30, 3), 80, dtype=np.uint8)
         controller._accept(
             settings["mqtt"]["person_topic"],
-            {"passenger_id": "passenger-1", "local_id": "P001"},
+            {"passenger_id": "passenger-1", "local_id": "P001",
+             "images": {"upper": encode_image(sample_image),
+                        "face": encode_image(sample_image)}},
             now,
         )
+        controller._store_result({
+            "captured_at_ms": now,
+            "completed_at_ms": now + 5,
+            "regions": {
+                "A": {
+                    "candidates": [{
+                        "label": "passenger-1", "display_label": "P001",
+                        "score": 0.58, "second_score": 0.49,
+                        "match_margin": 0.09, "detector_score": 0.91,
+                        "bbox_xyxy": [2, 3, 20, 30], "tid": 7,
+                        "status": "below_threshold",
+                        "accepted_label": None,
+                        "ranked_candidates": [
+                            {"rank": 1, "label": "passenger-1", "score": .58},
+                            {"rank": 2, "label": "not-in-gallery", "score": .49}],
+                    }],
+                    "detections": [], "conflicts": [],
+                },
+            },
+            "_frame": np.full((40, 30, 3), 160, dtype=np.uint8),
+            "_source_frame": sample_image,
+            "metrics": {
+                "device": "cpu", "processing_ms": 5.0, "detection_ms": 2.0,
+                "reid_ms": 2.0, "matching_ms": 1.0, "input_age_ms": 0,
+                "worker_age_ms": 5, "gallery_ms": 1.0, "gallery_count": 1,
+                "gallery_pending": 0, "processed": 1, "skipped": 0,
+                "capture_fps": 5.0, "inference_fps": 5.0, "reconnects": 0,
+            },
+        })
+        controller._flush_result()
         controller._record_decisions([{
             "roi_id": "A", "rfid": "TRAY-1", "status": "bound",
             "reason": "unique_candidate", "passenger_id": "passenger-1",
@@ -562,11 +595,101 @@ class IntegrationTest(unittest.TestCase):
         self.assertTrue(metadata["duration_ms"] >= 0)
         self.assertEqual({
             "session_started", "person_collected", "binding_decision",
-            "manual_observation", "session_stopped",
+            "recognition", "manual_observation", "session_stopped",
         }, {event["event_type"] for event in events})
         self.assertEqual(1, summary["field_test"]["manual_observations"])
+        self.assertEqual(1, summary["field_test"]["test_results"])
+        self.assertGreaterEqual(summary["field_test"]["images_saved"], 4)
         self.assertEqual(1, summary["field_test"]["event_counts"]["binding_decision"])
-        self.assertTrue((run_dir / "performance.jsonl").is_file())
+        self.assertFalse((run_dir / "performance.jsonl").exists())
+        result = json.loads(
+            (run_dir / "test_results.jsonl").read_text(encoding="utf-8").strip())
+        self.assertEqual(0.58, result["data"]["regions"]["A"]["candidates"][0]["score"])
+        image_paths = [
+            result["data"]["images"]["annotated_frame"],
+            *result["data"]["images"]["candidate_crops"],
+        ]
+        for relative in image_paths:
+            self.assertTrue((run_dir / relative).is_file(), relative)
+        self.assertEqual(
+            {"upper", "face"},
+            set(next(event for event in events
+                     if event["event_type"] == "person_collected")["data"]["images"]),
+        )
+        candidate = result["data"]["regions"]["A"]["candidates"][0]
+        self.assertIsNone(candidate["accepted_label"])
+        self.assertEqual(candidate["reference_images"],
+                         candidate["ranked_candidates"][0]["reference_images"])
+        self.assertEqual({}, candidate["ranked_candidates"][1]["reference_images"])
+        crop = cv2.imdecode(np.fromfile(run_dir / candidate["image_path"], np.uint8),
+                            cv2.IMREAD_COLOR)
+        self.assertTrue(np.array_equal(sample_image[3:30, 2:20], crop))
+        for relative in candidate["reference_images"].values():
+            reference = cv2.imdecode(np.fromfile(run_dir / relative, np.uint8),
+                                     cv2.IMREAD_COLOR)
+            self.assertTrue(np.array_equal(sample_image, reference))
+        self.assertNotIn("_source_frame", result["data"])
+
+    def test_test_recording_keeps_frames_when_display_only_keeps_latest(self):
+        self.settings["debug"]["field_test"]["enabled"] = True
+        controller = self.controller()
+        for index in range(4):
+            controller._store_result({
+                "captured_at_ms": index,
+                "completed_at_ms": index + 1,
+                "regions": {"A": {"candidates": [], "detections": []}},
+                "metrics": {},
+                "_frame": np.full((32, 32, 3), index * 50, np.uint8),
+                "_source_frame": np.full((32, 32, 3), index * 50, np.uint8),
+            })
+        self.assertEqual(3, controller._latest_result["captured_at_ms"])
+        run_dir = controller.run_dir
+        controller.stop()
+        results = [
+            json.loads(line) for line in
+            (run_dir / "test_results.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([0, 1, 2, 3], [r["data"]["captured_at_ms"] for r in results])
+        for result in results:
+            self.assertTrue((run_dir / result["data"]["images"]["source_frame"]).is_file())
+
+    def test_image_save_failure_keeps_detection_data_and_reports_error(self):
+        self.settings["debug"]["field_test"]["enabled"] = True
+        controller = self.controller()
+        logs = []
+        controller.log.connect(logs.append)
+        with patch.object(Path, "write_bytes", side_effect=OSError("disk full")):
+            controller._store_result({
+                "captured_at_ms": 1000, "completed_at_ms": 1010,
+                "regions": {"A": {"candidates": [], "detections": []}},
+                "metrics": {}, "_frame": np.zeros((32, 32, 3), np.uint8),
+            })
+        run_dir = controller.run_dir
+        controller.stop()
+        result = json.loads((run_dir / "test_results.jsonl").read_text(encoding="utf-8"))
+        self.assertEqual({}, result["data"]["images"])
+        self.assertTrue(any("disk full" in text for text in logs))
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(2, summary["field_test"]["image_errors"])
+
+    def test_disabling_test_recording_creates_no_test_files(self):
+        controller = self.controller()
+        controller._store_result({
+            "captured_at_ms": 1000, "_frame": np.zeros((32, 32, 3), np.uint8)})
+        run_dir = controller.run_dir
+        controller.stop()
+        self.assertFalse((run_dir / "test_results.jsonl").exists())
+        self.assertFalse((run_dir / "test_images").exists())
+
+    def test_test_recording_form_preserves_old_metadata_and_independent_performance_setting(self):
+        self.settings["debug"]["field_test"].update(enabled=True, operator="tester")
+        window = IntegrationWindow(self.settings)
+        self.windows.append(window)
+        self.assertFalse(hasattr(window, "field_test_expected"))
+        self.assertFalse(hasattr(window, "field_test_operator"))
+        collected = window.collect()
+        self.assertFalse(collected["debug"]["enabled"])
+        self.assertTrue(collected["debug"]["field_test"]["enabled"])
+        self.assertEqual("tester", collected["debug"]["field_test"]["operator"])
 
     def test_stale_positions_never_gain_dwell_when_repeated(self):
         controller = self.controller()

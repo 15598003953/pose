@@ -86,6 +86,9 @@ class IntegrationController(QObject):
         self.field_test_enabled = False
         self._field_test_meta = None
         self._field_test_counts = Counter()
+        self._field_test_image_index = 0
+        self._field_test_lock = threading.RLock()
+        self._field_test_gallery = {}
 
     def _store_frame(self, stage, image):
         # 每路只保留最新画面，后台推理较慢时也不积压界面事件。
@@ -93,6 +96,14 @@ class IntegrationController(QObject):
             self._preview_frames[stage] = image
 
     def _store_result(self, report):
+        # 逐帧记录独立于只保留最新结果的界面刷新。
+        if self.field_test_enabled:
+            with self._field_test_lock:
+                try:
+                    self._record_test_result(report)
+                except (OSError, ValueError, TypeError) as exc:
+                    self._field_test_counts["result_errors"] += 1
+                    self.write_log("测试结果保存失败：" + str(exc))
         with self._display_lock:
             self._latest_result = report
 
@@ -127,14 +138,13 @@ class IntegrationController(QObject):
         with self.inbox.lock:
             metrics["message_pending"] = len(self.inbox.items)
         metrics["position_age_ms"] = dict(self._position_ages)
-        self._record_field_event("recognition", {
-            key: value for key, value in report.items() if key != "_frame"})
         self.recognition.emit(report)
         now = time.monotonic()
         if self.debug_enabled and now >= self._next_debug:
             self._next_debug = now + 1
             performance_report = {
-                key: value for key, value in report.items() if key != "_frame"}
+                key: value for key, value in report.items()
+                if key not in ("_frame", "_source_frame")}
             self._handles["performance"].write(
                 json.dumps(performance_report, ensure_ascii=False) + "\n")
             self._handles["performance"].flush()
@@ -158,18 +168,156 @@ class IntegrationController(QObject):
             json.dumps(self._field_test_meta, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8")
 
-    def _record_field_event(self, event_type, data=None):
-        handle = self._handles.get("field_test")
-        if handle is None:
-            return
-        record = {
-            "event_type": event_type,
-            "recorded_at_ms": self.inbox.now(),
-            "data": data or {},
+    @staticmethod
+    def _safe_image_part(value):
+        value = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value if value is not None else "unknown"))
+        return value[:80] or "unknown"
+
+    def _next_field_test_stem(self, prefix):
+        self._field_test_image_index += 1
+        return "{}_{:06d}".format(prefix, self._field_test_image_index)
+
+    def _save_field_test_image(self, folder, stem, image, extension=".png"):
+        if not self.field_test_enabled or image is None:
+            return None
+        if not hasattr(image, "size") or image.size == 0:
+            return None
+        import cv2
+
+        path = self.run_dir / "test_images" / folder / (stem + extension)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            ok, encoded = cv2.imencode(
+                extension, image,
+                [cv2.IMWRITE_JPEG_QUALITY, 95] if extension == ".jpg"
+                else [cv2.IMWRITE_PNG_COMPRESSION, 1])
+            if not ok:
+                raise ValueError("图像编码失败")
+            path.write_bytes(encoded.tobytes())
+        except (OSError, ValueError, TypeError, cv2.error) as exc:
+            self._field_test_counts["image_errors"] += 1
+            self.write_log("测试图像保存失败：{}；{}".format(path, exc))
+            return None
+        self._field_test_counts["images_saved"] += 1
+        return path.relative_to(self.run_dir).as_posix()
+
+    @staticmethod
+    def _crop_field_test_image(image, box):
+        if image is None or not hasattr(image, "shape") or box is None:
+            return None
+        height, width = image.shape[:2]
+        x1, y1, x2, y2 = [int(value) for value in box]
+        x1, y1 = max(0, min(width, x1)), max(0, min(height, y1))
+        x2, y2 = max(x1, min(width, x2)), max(y1, min(height, y2))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return image[y1:y2, x1:x2].copy()
+
+    def _save_field_test_person_images(self, payload):
+        if not self.field_test_enabled:
+            return {}
+        from pose_project.reid.messaging import decode_base64_image
+
+        images = payload.get("images") or {}
+        if not isinstance(images, dict):
+            raise ValueError("images 必须是 JSON 对象")
+        local_id = payload.get("local_id") or payload.get("passenger_id")
+        stem = self._next_field_test_stem(
+            "gallery_" + self._safe_image_part(local_id))
+        saved = {}
+        for name in ("upper", "face"):
+            image = decode_base64_image(images.get(name))
+            if images.get(name) and image is None:
+                self._field_test_counts["image_errors"] += 1
+                self.write_log("测试图像解码失败：{} / {}".format(local_id, name))
+            path = self._save_field_test_image("gallery", stem + "_" + name, image)
+            if path:
+                saved[name] = path
+        passenger = payload.get("passenger_id") or payload.get("person_id")
+        if isinstance(passenger, str):
+            self._field_test_gallery[passenger] = saved
+        return saved
+
+    def _record_test_result(self, report):
+        import cv2
+
+        data = {
+            key: deepcopy(value)
+            for key, value in report.items()
+            if key not in ("_frame", "_source_frame")
         }
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        handle.flush()
-        self._field_test_counts[event_type] += 1
+        source_frame = report.get("_source_frame")
+        if source_frame is None:
+            source_frame = report.get("_frame")
+        captured_at = report.get("captured_at_ms", self.inbox.now())
+        stem = self._next_field_test_stem(
+            "reid_{:013d}".format(int(captured_at)))
+        images = {}
+        source_path = self._save_field_test_image(
+            "reid_frames", stem + "_source", source_frame, ".jpg")
+        if source_path:
+            images["source_frame"] = source_path
+        annotated = source_frame.copy() if source_frame is not None else None
+        crops = []
+        for region_id, region in data.get("regions", {}).items():
+            for index, candidate in enumerate(region.get("candidates") or []):
+                candidate["reference_images"] = dict(
+                    self._field_test_gallery.get(candidate.get("label"), {}))
+                for ranked in candidate.get("ranked_candidates", []):
+                    ranked["reference_images"] = dict(
+                        self._field_test_gallery.get(ranked["label"], {}))
+                crop = self._crop_field_test_image(
+                    source_frame, candidate.get("bbox_xyxy"))
+                crop_path = self._save_field_test_image(
+                    "reid_crops",
+                    "{}_{}_{}_{}".format(
+                        stem, self._safe_image_part(region_id),
+                        self._safe_image_part(candidate.get("tid")),
+                        index),
+                    crop,
+                )
+                if crop_path:
+                    candidate["image_path"] = crop_path
+                    crops.append(crop_path)
+                box = candidate.get("bbox_xyxy")
+                if annotated is not None and box is not None:
+                    x1, y1, x2, y2 = map(int, box)
+                    color = (60, 185, 70) if candidate.get("status") == "matched" else (0, 180, 255)
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                    text = "{} T{} {} {}".format(
+                        region_id, candidate.get("tid"), candidate.get("score"),
+                        candidate.get("status"))
+                    cv2.putText(annotated, text, (max(0, x1), max(14, y1 - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, .45, color, 1, cv2.LINE_AA)
+        frame_path = self._save_field_test_image(
+            "reid_frames", stem + "_annotated", annotated, ".jpg")
+        if frame_path:
+            images["annotated_frame"] = frame_path
+        if crops:
+            images["candidate_crops"] = crops
+        data["images"] = images
+        self._handles["test_results"].write(json.dumps({
+            "recorded_at_ms": self.inbox.now(),
+            "data": data,
+        }, ensure_ascii=False) + "\n")
+        self._handles["test_results"].flush()
+        self._field_test_counts["test_results"] += 1
+        self._record_field_event("recognition", data)
+        return data
+
+    def _record_field_event(self, event_type, data=None):
+        with self._field_test_lock:
+            handle = self._handles.get("field_test")
+            if handle is None:
+                return
+            record = {
+                "event_type": event_type,
+                "recorded_at_ms": self.inbox.now(),
+                "data": data or {},
+            }
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+            self._field_test_counts[event_type] += 1
 
     def record_field_observation(self, category, result, expected, actual, note,
                                  context=None):
@@ -211,13 +359,17 @@ class IntegrationController(QObject):
         field_test = self.settings.get("debug", {}).get("field_test", {})
         self.field_test_enabled = bool(field_test.get("enabled", False))
         self._field_test_counts.clear()
+        self._field_test_image_index = 0
+        self._field_test_gallery.clear()
         self._field_test_meta = None
         if self.field_test_enabled:
             self._handles["field_test"] = (
                 self.run_dir / "field_test_events.jsonl").open("a", encoding="utf-8")
+            self._handles["test_results"] = (
+                self.run_dir / "test_results.jsonl").open("a", encoding="utf-8")
             started_at_ms = self.inbox.now()
             self._field_test_meta = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": "running",
                 "session_id": self.run_dir.name,
                 "started_at_ms": started_at_ms,
@@ -242,6 +394,7 @@ class IntegrationController(QObject):
                 },
                 "files": [
                     "field_test.json", "field_test_events.jsonl",
+                    "test_results.jsonl", "test_images/",
                     "settings.json", "runtime.log", "messages.jsonl",
                     "decisions.jsonl", "summary.json",
                 ],
@@ -264,9 +417,7 @@ class IntegrationController(QObject):
         self._next_preview = self._next_debug = 0.0
         self.running = True
         self.stopping = False
-        self.set_debug(
-            settings.get("debug", {}).get("enabled", False) or
-            self.field_test_enabled)
+        self.set_debug(settings.get("debug", {}).get("enabled", False))
         self.running_changed.emit(True)
         try:
             if settings["transport"] == "mqtt":
@@ -397,11 +548,12 @@ class IntegrationController(QObject):
             if worker is not None and worker.isRunning():
                 worker.add_person(payload)
             self.counts["persons"] += 1
-            self._record_field_event("person_collected", {
-                key: payload.get(key) for key in (
-                    "passenger_id", "person_id", "local_id",
-                    "capture_time", "source_video")
-            })
+            with self._field_test_lock:
+                self._record_field_event("person_collected", {
+                    key: payload.get(key) for key in (
+                        "passenger_id", "person_id", "local_id",
+                        "capture_time", "source_video")
+                } | {"images": self._save_field_test_person_images(payload)})
             return
         if topic == self.settings["binding"]["topics"]["rfid"]:
             if retained:
@@ -521,6 +673,10 @@ class IntegrationController(QObject):
             summary["field_test"] = {
                 "manual_observations": self._field_test_counts["manual_observation"],
                 "recognition_records": self._field_test_counts["recognition"],
+                "test_results": self._field_test_counts["test_results"],
+                "images_saved": self._field_test_counts["images_saved"],
+                "image_errors": self._field_test_counts["image_errors"],
+                "result_errors": self._field_test_counts["result_errors"],
                 "event_counts": dict(self._field_test_counts),
             }
         (self.run_dir / "summary.json").write_text(

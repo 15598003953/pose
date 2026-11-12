@@ -11,8 +11,8 @@ import sys
 import time
 import uuid
 
-from PyQt5.QtCore import QCoreApplication, QSize, Qt, QTimer
-from PyQt5.QtGui import QFont, QFontDatabase, QIcon, QImage, QPixmap
+from PyQt5.QtCore import QCoreApplication, QSize, Qt, QTimer, QUrl
+from PyQt5.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
@@ -278,68 +278,23 @@ class IntegrationWindow(QMainWindow):
         field_test_panel = QWidget()
         field_test_layout = QVBoxLayout(field_test_panel)
         field_test_form = QFormLayout()
-        self.field_test_enabled = QCheckBox("启用现场测试记录")
+        self.field_test_enabled = QCheckBox("启用测试结果记录")
         self.field_test_enabled.setToolTip(
-            "保存每帧识别结果、绑定判定和人工核对记录")
+            "保存识别数据、标注画面、目标裁剪图和人物库参考图")
         field_test_form.addRow(self.field_test_enabled)
         self.field_test_id = QLineEdit()
-        self.field_test_operator = QLineEdit()
-        self.field_test_site = QLineEdit()
-        self.field_test_scenario = QLineEdit()
-        self.field_test_notes = QPlainTextEdit()
-        self.field_test_notes.setMaximumHeight(72)
-        self.field_test_id.setPlaceholderText("例如 FT-20261110-01")
-        self.field_test_operator.setPlaceholderText("记录人员")
-        self.field_test_site.setPlaceholderText("机场、通道或设备位置")
-        self.field_test_scenario.setPlaceholderText("例如 单人连续通行、多人排队、遮挡返回")
-        self.field_test_notes.setPlaceholderText("本次测试的目标、设备和补充说明")
-        field_test_form.addRow("测试编号", self.field_test_id)
-        field_test_form.addRow("记录人员", self.field_test_operator)
-        field_test_form.addRow("测试地点", self.field_test_site)
-        field_test_form.addRow("测试场景", self.field_test_scenario)
-        field_test_form.addRow("测试说明", self.field_test_notes)
+        field_test_form.addRow("测试编号（可选）", self.field_test_id)
         field_test_layout.addLayout(field_test_form)
-        field_test_layout.addWidget(QLabel(
-            "启动后自动保存 field_test.json 和 field_test_events.jsonl；"
-            "现场图片、原始视频和设备截图仍需单独归档。"))
-        observation_form = QFormLayout()
-        self.field_test_category = QComboBox()
-        for label, value in (
-                ("闸机抓拍", "gate_capture"), ("旅客重识别", "reid"),
-                ("行李框绑定", "binding"), ("视频取流", "stream"),
-                ("MQTT 消息", "mqtt"), ("性能", "performance"),
-                ("其他", "other")):
-            self.field_test_category.addItem(label, value)
-        self.field_test_result = QComboBox()
-        for label, value in (("通过", "pass"), ("失败", "fail"),
-                             ("待核对", "uncertain")):
-            self.field_test_result.addItem(label, value)
-        self.field_test_expected = QLineEdit()
-        self.field_test_actual = QLineEdit()
-        self.field_test_note = QLineEdit()
-        self.field_test_expected.setPlaceholderText("现场应出现的结果")
-        self.field_test_actual.setPlaceholderText("现场实际观察到的结果")
-        self.field_test_note.setPlaceholderText("补充现象、截图编号或视频时间点")
-        observation_form.addRow("核对类别", self.field_test_category)
-        observation_form.addRow("核对结论", self.field_test_result)
-        observation_form.addRow("预期结果", self.field_test_expected)
-        observation_form.addRow("实际结果", self.field_test_actual)
-        observation_form.addRow("现场备注", self.field_test_note)
-        field_test_layout.addLayout(observation_form)
-        self.field_test_record = QPushButton("记录现场观察")
-        self.field_test_record.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
-        self.field_test_record.clicked.connect(self.record_field_observation)
-        field_test_layout.addWidget(self.field_test_record)
-        self.field_test_path = QLabel("尚未启动现场测试记录")
+        self.field_test_path = QLabel("尚未生成测试结果")
         self.field_test_path.setWordWrap(True)
+        self.field_test_path.setTextInteractionFlags(Qt.TextSelectableByMouse)
         field_test_layout.addWidget(self.field_test_path)
-        self.field_test_table = table(
-            ["时间", "类别", "结论", "预期", "实际", "备注"])
-        self.field_test_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.field_test_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        self.field_test_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
-        field_test_layout.addWidget(self.field_test_table, 1)
-        self.event_tabs.addTab(field_test_panel, "现场测试")
+        self.field_test_open = self.icon_button(
+            QStyle.SP_DirOpenIcon, "打开结果目录", self.open_test_results)
+        self.field_test_open.setEnabled(False)
+        field_test_layout.addWidget(self.field_test_open, 0, Qt.AlignLeft)
+        field_test_layout.addStretch(1)
+        self.event_tabs.addTab(field_test_panel, "测试记录")
         right.addWidget(self.event_tabs)
         right.setSizes([360, 400])
         horizontal.addWidget(right)
@@ -637,10 +592,7 @@ class IntegrationWindow(QMainWindow):
         field_test = settings.get("debug", {}).get("field_test", {})
         self.field_test_enabled.setChecked(field_test.get("enabled", False))
         self.field_test_id.setText(field_test.get("test_id", ""))
-        self.field_test_operator.setText(field_test.get("operator", ""))
-        self.field_test_site.setText(field_test.get("site", ""))
-        self.field_test_scenario.setText(field_test.get("scenario", ""))
-        self.field_test_notes.setPlainText(field_test.get("notes", ""))
+        self.debug_recording.setChecked(settings.get("debug", {}).get("enabled", False))
         self.threshold.setValue(settings["reid"]["threshold"])
         for name, control in self.reid_controls.items():
             control.setValue(settings["reid"].get(name, REID_RUNTIME_DEFAULTS[name]))
@@ -681,17 +633,11 @@ class IntegrationWindow(QMainWindow):
             enabled_regions=[key for key, box in self.region_enabled.items() if box.isChecked()])
         settings["reid"].update({name: control.value() for name, control in self.reid_controls.items()})
         settings["reid"]["flip_tta"] = self.flip_tta.isChecked()
-        settings["debug"] = {
-            "enabled": self.debug_recording.isChecked() or self.field_test_enabled.isChecked(),
-            "field_test": {
-                "enabled": self.field_test_enabled.isChecked(),
-                "test_id": self.field_test_id.text().strip(),
-                "operator": self.field_test_operator.text().strip(),
-                "site": self.field_test_site.text().strip(),
-                "scenario": self.field_test_scenario.text().strip(),
-                "notes": self.field_test_notes.toPlainText().strip(),
-            },
-        }
+        debug = settings.setdefault("debug", {})
+        debug["enabled"] = self.debug_recording.isChecked()
+        debug.setdefault("field_test", {}).update(
+            enabled=self.field_test_enabled.isChecked(),
+            test_id=self.field_test_id.text().strip())
         for name, control in self.region_front_modes.items():
             settings["binding"]["regions"][name]["front_mode"] = control.currentData()
         settings["binding"]["binding_parameters"] = {
@@ -791,8 +737,7 @@ class IntegrationWindow(QMainWindow):
         for region, result in report["regions"].items():
             for candidate in result["candidates"]:
                 passenger = candidate.get("label")
-                if passenger and candidate.get("status") not in (
-                        "passenger_locked", "duplicate", "waiting_track"):
+                if passenger and candidate.get("status") == "matched":
                     evidence = self._evidence.setdefault(passenger, {
                         "passenger_id": passenger,
                         "local_id": candidate.get("display_label", ""),
@@ -809,8 +754,11 @@ class IntegrationWindow(QMainWindow):
                         "frame": reid_frame,
                     }
                 score = candidate.get("score")
+                identity = candidate.get("display_label") or passenger or "未识别"
+                if passenger and candidate.get("status") != "matched":
+                    identity = "未确认（候选：{}）".format(identity)
                 add_row(self.recognition_table, [
-                    region, candidate.get("tid", ""), candidate.get("label") or "未识别",
+                    region, candidate.get("tid", ""), identity,
                     "{:.3f}".format(score) if score is not None else "",
                     statuses.get(candidate["status"], candidate["status"]),
                     str(candidate["bbox_xyxy"])], limit=1000, autoscroll=False)
@@ -961,11 +909,11 @@ class IntegrationWindow(QMainWindow):
             self._set_evidence_image(self.evidence_gate_image, None, "暂无闸机抓拍")
             self._set_evidence_image(self.evidence_reid_image, None, "暂无供框台目标")
             self.event_tabs.setTabText(2, "旅客库")
-            self.field_test_table.setRowCount(0)
             self.field_test_path.setText(
-                "现场测试记录目录：" + str(self.controller.run_dir)
+                "测试结果目录：" + str(self.controller.run_dir)
                 if self.controller.field_test_enabled
-                else "本次未启用现场测试记录")
+                else "本次未启用测试结果记录")
+            self.field_test_open.setEnabled(self.controller.field_test_enabled)
             self.details.clear()
             self.session_label.setText("运行中")
             self.session_label.setToolTip(str(self.controller.run_dir))
@@ -984,21 +932,20 @@ class IntegrationWindow(QMainWindow):
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.settings_tabs.setEnabled(not running)
-        metadata_controls = (
-            self.field_test_enabled, self.field_test_id, self.field_test_operator,
-            self.field_test_site, self.field_test_scenario, self.field_test_notes)
+        metadata_controls = (self.field_test_enabled, self.field_test_id)
         for control in metadata_controls:
             control.setEnabled(not running)
-        self.field_test_record.setEnabled(running and self.controller.field_test_enabled)
         self.rfid_send.setEnabled(running)
         self.import_button.setEnabled(running)
         if not running:
             self.session_label.setText("未启动" if self.controller.run_dir is None else "已停止")
 
     def _stopped(self):
-        if self.controller.run_dir is not None and self.controller.field_test_enabled:
+        if (self.controller.run_dir is not None
+                and (self.controller.run_dir / "test_results.jsonl").is_file()):
             self.field_test_path.setText(
-                "现场测试记录目录：" + str(self.controller.run_dir))
+                "测试结果目录：" + str(self.controller.run_dir))
+            self.field_test_open.setEnabled(True)
         if self._closing and not self.previews:
             self.close()
 
@@ -1180,40 +1127,9 @@ class IntegrationWindow(QMainWindow):
         }
         self.evidence_details.setPlainText(json.dumps(details, ensure_ascii=False, indent=2))
 
-    def record_field_observation(self):
-        latest = self._latest_recognition or {}
-        context = {"selected_passenger_id": self._selected_evidence_id()}
-        if latest:
-            context["latest_recognition"] = {
-                key: value for key, value in latest.items() if key != "_frame"}
-            context["latest_recognition"].pop("metrics", None)
-            context["latest_recognition"]["metrics"] = dict(
-                latest.get("metrics") or {})
-        try:
-            values = self.controller.record_field_observation(
-                self.field_test_category.currentData(),
-                self.field_test_result.currentData(),
-                self.field_test_expected.text(),
-                self.field_test_actual.text(),
-                self.field_test_note.text(),
-                context,
-            )
-        except ValueError as exc:
-            self.error(str(exc))
-            return
-        result_labels = {"pass": "通过", "fail": "失败", "uncertain": "待核对"}
-        category_labels = {
-            self.field_test_category.itemData(index): self.field_test_category.itemText(index)
-            for index in range(self.field_test_category.count())}
-        add_row(self.field_test_table, [
-            datetime.now().strftime("%H:%M:%S"),
-            category_labels.get(values["category"], values["category"]),
-            result_labels.get(values["result"], values["result"]),
-            values["expected"], values["actual"], values["note"],
-        ], limit=500)
-        self.field_test_expected.clear()
-        self.field_test_actual.clear()
-        self.field_test_note.clear()
+    def open_test_results(self):
+        if self.controller.run_dir is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.controller.run_dir)))
 
     def send_rfid(self):
         try:

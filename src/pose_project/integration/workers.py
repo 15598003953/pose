@@ -366,7 +366,11 @@ class RecognitionWorker(QThread):
                           else candidate for candidate in candidates]
             candidates = [
                 dict(candidate, display_label=self.gallery.get(
-                    candidate["label"], {}).get("display_label", ""))
+                    candidate["label"], {}).get("display_label", ""),
+                     ranked_candidates=[
+                         dict(row, display_label=self.gallery.get(
+                             row["label"], {}).get("display_label", ""))
+                         for row in candidate.get("ranked_candidates", [])])
                 for candidate in candidates]
             regions[region_id] = {"candidates": candidates, "detections": people,
                                   "conflicts": conflicts}
@@ -378,7 +382,7 @@ class RecognitionWorker(QThread):
         completed = self.clock()
         self.result.emit({
             "captured_at_ms": captured_at, "completed_at_ms": completed, "regions": regions,
-            "_frame": canvas,
+            "_frame": canvas, "_source_frame": image,
             "metrics": dict(timing,
                 processing_ms=round((time.perf_counter() - started) * 1000, 2),
                 input_age_ms=max(0, selected_at - captured_at),

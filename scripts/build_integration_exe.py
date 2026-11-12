@@ -114,6 +114,7 @@ def main():
                                   encoding="utf-8", newline="\r\n")
     text = (ROOT / "docs/EXE_DEPLOYMENT.md").read_text(encoding="utf-8")
     (bundle / "README.md").write_text(text.replace("PoseIntegration", args.name), encoding="utf-8")
+    shutil.copy2(ROOT / "docs/FIELD_TEST_RECORDING.md", bundle / "FIELD_TEST_RECORDING.md")
     shutil.copy2(ROOT / "LICENSE", bundle / "LICENSE")
     versions = {}
     license_dir = bundle / "licenses"

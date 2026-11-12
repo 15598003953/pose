@@ -93,6 +93,7 @@ def main():
         "A": {"roi_xyxy": [0, 0, width, height],
               "operation_roi_xyxy": [0, 0, width, height]}}
     settings["output_dir"] = str(output / "sessions")
+    settings["debug"]["field_test"].update(enabled=True, test_id="LOCAL-RECORDING-CHECK")
     app = QApplication.instance() or QApplication([])
     configure_application(app)
     window = IntegrationWindow(settings, output / "saved_settings.json")
@@ -130,14 +131,38 @@ def main():
         window.stop_session()
         wait_until(lambda: not window.controller.running, 60)
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        results = [
+            json.loads(line)["data"] for line in
+            (run_dir / "test_results.jsonl").read_text(encoding="utf-8").splitlines()]
+        image_paths = set()
+        candidates = []
+        for result in results:
+            image_paths.update(result["images"].get(key) for key in
+                               ("source_frame", "annotated_frame"))
+            for region in result["regions"].values():
+                for candidate in region["candidates"]:
+                    candidates.append(candidate)
+                    image_paths.add(candidate.get("image_path"))
+                    image_paths.update(candidate.get("reference_images", {}).values())
+                    for ranked in candidate.get("ranked_candidates", []):
+                        image_paths.update(ranked.get("reference_images", {}).values())
+        image_paths.discard(None)
+        images_ok = bool(image_paths) and all(
+            cv2.imdecode(np.fromfile(run_dir / path, np.uint8), cv2.IMREAD_COLOR)
+            is not None for path in image_paths)
+        recording_ok = bool(results) and bool(candidates) and images_ok and all(
+            "ranked_candidates" in row and "accepted_label" in row for row in candidates)
         report = {
             "ok": frames["gate"] > 0 and frames["reid"] > 0 and gallery_count == 1
                   and any(row["detections"] for row in position_messages)
-                  and not summary.get("gate_errors") and not summary.get("reid_errors"),
+                  and not summary.get("gate_errors") and not summary.get("reid_errors")
+                  and recording_ok,
             "gate_fixture_frames": gate_frames, "reid_fixture_frames": reid_frames,
             "preview_frames": frames, "gallery_count": gallery_count,
             "recognized_position_messages": sum(bool(row["detections"]) for row in position_messages),
             "summary": summary, "run_dir": str(run_dir),
+            "recorded_results": len(results), "recorded_images": len(image_paths),
+            "recording_ok": recording_ok,
             "scope": "Local clips, real gate/YOLO/FastReID models, local transport, Qt controls",
             "not_verified": "Live cameras, real RFID, production broker, field accuracy",
         }

@@ -267,8 +267,11 @@ class TrackMatcher:
             if locked_index is not None:
                 label_index = locked_index
                 sim = float(st.get("confirmed_score", self.threshold))
-                second_score = None
-                margin = None
+                second_score = st.get("confirmed_second_score")
+                margin = st.get("confirmed_margin")
+                ranked_candidates = st["confirmed_ranking"]
+                score_source = "locked_confirmation"
+                feature_frame_index = st["confirmed_feature_frame_index"]
                 stable = True
                 status = "matched"
             elif st is not None and len(st["hist"]) > 0:
@@ -308,6 +311,14 @@ class TrackMatcher:
                 stable = False
                 status = ("below_threshold" if sim < self.threshold else
                           "waiting_track")
+            if locked_index is None:
+                ranked_candidates = [
+                    {"rank": rank + 1, "label": self.label_names[index],
+                     "score": round(float(vec[index]), 4)}
+                    for rank, index in enumerate(
+                        np.argsort(-vec, kind="stable")[:3])]
+                score_source = "track_history" if st is not None else "current_feature"
+                feature_frame_index = self._feat_cache.get(tid, {}).get("age", self.idx)
             label = self.label_names[label_index]
             owner = self.passenger_locks.get(label)
             if owner is not None and (st is None or owner is not st["token"]):
@@ -322,6 +333,11 @@ class TrackMatcher:
                                "detector_score": round(float(confs[i]), 4),
                                "bbox_xyxy": [x1, y1, x2, y2], "tid": tid,
                                "status": status,
+                               "accepted_label": None,
+                               "ranked_candidates": ranked_candidates,
+                               "score_source": score_source,
+                               "frame_index": self.idx,
+                               "feature_frame_index": feature_frame_index,
                                "identity_locked": locked_index is not None,
                                "identity_frozen": locked_index is not None,
                                "stable_candidate": stable})
@@ -352,6 +368,7 @@ class TrackMatcher:
                     state = matcher.tracks.get(candidate["tid"])
                     if state is None:
                         continue
+                    candidate["accepted_label"] = candidate["label"]
                     matcher.last_detections.append({
                         key: candidate[key]
                         for key in ("label", "score", "bbox_xyxy", "tid")})
@@ -378,6 +395,11 @@ class TrackMatcher:
                 matcher.passenger_locks[label] = state["token"]
                 state["label_index"] = matcher.label_names.index(label)
                 state["confirmed_score"] = candidate["score"]
+                state["confirmed_second_score"] = candidate["second_score"]
+                state["confirmed_margin"] = candidate["match_margin"]
+                state["confirmed_ranking"] = candidate["ranked_candidates"]
+                state["confirmed_feature_frame_index"] = candidate["feature_frame_index"]
+                candidate["accepted_label"] = label
                 candidate["identity_locked"] = True
                 candidate["identity_frozen"] = True
                 matcher.last_detections.append({

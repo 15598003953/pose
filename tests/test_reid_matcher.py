@@ -53,6 +53,48 @@ class _ConstantExtractor:
 
 
 class TrackMatcherTest(unittest.TestCase):
+    def test_rejected_match_keeps_ranked_candidates_without_an_accepted_identity(self):
+        matcher = TrackMatcher(
+            [{"label": "third", "feature": np.array([.2, .98])},
+             {"label": "first", "feature": np.array([.58, .81])},
+             {"label": "second", "feature": np.array([.5, .86])},
+             {"label": "fourth", "feature": np.array([.1, .99])}],
+            _Detector(), _ConstantExtractor(), threshold=.65)
+        frame = np.zeros((120, 80, 3), dtype=np.uint8)
+        for _ in range(3):
+            matcher.annotate(frame)
+        candidate = matcher.last_candidates[0]
+        self.assertEqual("below_threshold", candidate["status"])
+        self.assertIsNone(candidate["accepted_label"])
+        self.assertEqual(
+            ["first", "second", "third"],
+            [row["label"] for row in candidate["ranked_candidates"]])
+        self.assertEqual([.58, .5, .2],
+                         [row["score"] for row in candidate["ranked_candidates"]])
+        self.assertEqual("track_history", candidate["score_source"])
+        self.assertEqual(2, candidate["frame_index"])
+        self.assertEqual(0, candidate["feature_frame_index"])
+        self.assertEqual(1, matcher.extractor.calls)
+        self.assertEqual([], matcher.last_detections)
+        self.assertEqual({}, matcher.passenger_locks)
+
+    def test_locked_result_keeps_confirmation_ranking_and_marks_score_source(self):
+        matcher = TrackMatcher(
+            [{"label": "first", "feature": np.array([.9, .44])},
+             {"label": "second", "feature": np.array([.7, .71])}],
+            _Detector(), _ConstantExtractor(), threshold=.65)
+        frame = np.zeros((120, 80, 3), dtype=np.uint8)
+        for _ in range(3):
+            matcher.annotate(frame)
+        confirmed = matcher.last_candidates[0]
+        self.assertEqual("first", confirmed["accepted_label"])
+        matcher.annotate(frame)
+        locked = matcher.last_candidates[0]
+        self.assertEqual("locked_confirmation", locked["score_source"])
+        self.assertEqual(confirmed["ranked_candidates"], locked["ranked_candidates"])
+        self.assertEqual(confirmed["second_score"], locked["second_score"])
+        self.assertEqual(confirmed["match_margin"], locked["match_margin"])
+
     def test_track_keeps_first_confirmed_identity(self):
         frames = [
             [1.00, 0.00],
